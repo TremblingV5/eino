@@ -1,4 +1,4 @@
-/*
+/**
  * Copyright 2024 CloudWeGo Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -45,7 +45,11 @@ type CompletionTokensDetails struct {
 // PromptTokenDetails provides a breakdown of prompt token usage.
 type PromptTokenDetails struct {
 	// Cached tokens present in the prompt.
-	CachedTokens int
+	CachedTokens int `json:"cached_tokens"`
+	// CacheCreationTokens is the number of tokens used to create the cache (cache write).
+	// This is supported by providers like Anthropic (cache_creation_input_tokens),
+	// OpenAI (cache_write_tokens), and AWS Bedrock (cacheWriteInputTokens).
+	CacheCreationTokens int `json:"cache_creation_tokens"`
 }
 
 // Config is the config for the model.
