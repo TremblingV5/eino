@@ -1124,13 +1124,18 @@ func (a *TypedChatModelAgent[M]) buildMessageReActRunFunc(_ context.Context, bc 
 	return func(ctx context.Context, p *typedRunParams[M]) {
 		mp := any(p).(*typedRunParams[*schema.Message])
 		cancelCtx := mp.cancelCtx
-		msgConf.cancelCtx = cancelCtx
-		if msgConf.modelWrapperConf != nil {
-			msgConf.modelWrapperConf.cancelContext = cancelCtx
-		}
 		ctx = withCancelContext(ctx, cancelCtx)
 
-		g, err := newReact(ctx, msgConf)
+		// Per-run conf: stable fields shared by value; cancel pointers are run-local.
+		runConf := *msgConf
+		if msgConf.modelWrapperConf != nil {
+			mw := *msgConf.modelWrapperConf
+			mw.cancelContext = cancelCtx
+			runConf.modelWrapperConf = &mw
+		}
+		runConf.cancelCtx = cancelCtx
+
+		g, err := newReact(ctx, &runConf)
 		if err != nil {
 			mp.generator.Send(&AgentEvent{Err: err})
 			return
@@ -1262,13 +1267,18 @@ func (a *TypedChatModelAgent[M]) buildAgenticReActRunFunc(_ context.Context, bc 
 	return func(ctx context.Context, p *typedRunParams[M]) {
 		ap := any(p).(*typedRunParams[*schema.AgenticMessage])
 		cancelCtx := ap.cancelCtx
-		agenticConf.cancelCtx = cancelCtx
-		if agenticConf.modelWrapperConf != nil {
-			agenticConf.modelWrapperConf.cancelContext = cancelCtx
-		}
 		ctx = withCancelContext(ctx, cancelCtx)
 
-		g, err := newAgenticReact(ctx, agenticConf)
+		// Per-run conf: stable fields shared by value; cancel pointers are run-local.
+		runConf := *agenticConf
+		if agenticConf.modelWrapperConf != nil {
+			mw := *agenticConf.modelWrapperConf
+			mw.cancelContext = cancelCtx
+			runConf.modelWrapperConf = &mw
+		}
+		runConf.cancelCtx = cancelCtx
+
+		g, err := newAgenticReact(ctx, &runConf)
 		if err != nil {
 			ap.generator.Send(&TypedAgentEvent[*schema.AgenticMessage]{Err: err})
 			return
