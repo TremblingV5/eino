@@ -554,8 +554,10 @@ type CompletionTokensDetails struct {
 
 // PromptTokenDetails provides a breakdown of prompt token usage.
 type PromptTokenDetails struct {
-	// Cached tokens present in the prompt.
+	// CachedTokens is the number of prompt tokens read from the cache.
 	CachedTokens int `json:"cached_tokens"`
+	// CacheWriteTokens is the number of prompt tokens written to the cache.
+	CacheWriteTokens int `json:"cache_write_tokens"`
 }
 
 var _ MessagesTemplate = &Message{}
@@ -1303,6 +1305,7 @@ func concatToolCalls(chunks []ToolCall) ([]ToolCall, error) {
 
 		args.Reset()
 		toolID, toolType, toolName := "", "", "" // these field will output atomically in any chunk
+		extraList := make([]map[string]any, 0, len(v))
 
 		for _, n := range v {
 			chunk := chunks[n]
@@ -1337,12 +1340,24 @@ func concatToolCalls(chunks []ToolCall) ([]ToolCall, error) {
 					return nil, err
 				}
 			}
+
+			if len(chunk.Extra) > 0 {
+				extraList = append(extraList, chunk.Extra)
+			}
 		}
 
 		toolCall.ID = toolID
 		toolCall.Type = toolType
 		toolCall.Function.Name = toolName
 		toolCall.Function.Arguments = args.String()
+
+		if len(extraList) > 0 {
+			mergedExtra, err := concatExtra(extraList)
+			if err != nil {
+				return nil, fmt.Errorf("failed to concat tool call extra: %w", err)
+			}
+			toolCall.Extra = mergedExtra
+		}
 
 		merged = append(merged, toolCall)
 	}
@@ -1751,6 +1766,9 @@ func ConcatMessages(msgs []*Message) (*Message, error) {
 
 				if msg.ResponseMeta.Usage.PromptTokenDetails.CachedTokens > ret.ResponseMeta.Usage.PromptTokenDetails.CachedTokens {
 					ret.ResponseMeta.Usage.PromptTokenDetails.CachedTokens = msg.ResponseMeta.Usage.PromptTokenDetails.CachedTokens
+				}
+				if msg.ResponseMeta.Usage.PromptTokenDetails.CacheWriteTokens > ret.ResponseMeta.Usage.PromptTokenDetails.CacheWriteTokens {
+					ret.ResponseMeta.Usage.PromptTokenDetails.CacheWriteTokens = msg.ResponseMeta.Usage.PromptTokenDetails.CacheWriteTokens
 				}
 
 				if msg.ResponseMeta.Usage.CompletionTokensDetails.ReasoningTokens > ret.ResponseMeta.Usage.CompletionTokensDetails.ReasoningTokens {
