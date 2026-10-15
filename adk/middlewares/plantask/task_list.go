@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -90,9 +91,16 @@ func listTasks(ctx context.Context, backend Backend, baseDir string) ([]*task, e
 		tasks = append(tasks, taskData)
 	}
 
-	// sort tasks by ID
+	// sort tasks by ID in numeric order; task IDs are digit-only strings
+	// (see isValidTaskID), so a plain string comparison would produce
+	// "1, 10, 11, 2, 3, ..." once IDs reach two digits.
 	sort.Slice(tasks, func(i, j int) bool {
-		return tasks[i].ID < tasks[j].ID
+		left, errLeft := strconv.Atoi(tasks[i].ID)
+		right, errRight := strconv.Atoi(tasks[j].ID)
+		if errLeft != nil || errRight != nil {
+			return tasks[i].ID < tasks[j].ID
+		}
+		return left < right
 	})
 
 	return tasks, nil
