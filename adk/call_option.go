@@ -36,7 +36,17 @@ type AgentRunOption struct {
 }
 
 func (o AgentRunOption) DesignateAgent(name ...string) AgentRunOption {
-	o.agentNames = append(o.agentNames, name...)
+	if len(name) == 0 {
+		return o
+	}
+	// Copy the existing names before appending so that options derived from the
+	// same base option never share the backing array. Otherwise appending to one
+	// derived option can overwrite the designated agents of another one when the
+	// base slice still has spare capacity.
+	agentNames := make([]string, 0, len(o.agentNames)+len(name))
+	agentNames = append(agentNames, o.agentNames...)
+	agentNames = append(agentNames, name...)
+	o.agentNames = agentNames
 	return o
 }
 
