@@ -347,6 +347,13 @@ func (b *InMemoryBackend) compilePattern(req *GrepRequest) (*regexp.Regexp, erro
 	if req.CaseInsensitive {
 		pattern = "(?i)" + pattern
 	}
+	if req.EnableMultiline {
+		// Multiline mode is documented to behave like `rg -U --multiline-dotall`,
+		// so let '.' match newlines by default. An explicit flag such as
+		// `(?-s)` at the beginning of the caller's pattern still takes
+		// precedence, because flags are applied left to right.
+		pattern = "(?s)" + pattern
+	}
 	re, err := regexp.Compile(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("invalid regex pattern: %w", err)

@@ -1768,6 +1768,83 @@ func TestInMemoryBackend_GrepRaw_WithContext(t *testing.T) {
 	})
 }
 
+func TestInMemoryBackend_GrepRaw_MultilineDotall(t *testing.T) {
+	backend := NewInMemoryBackend()
+	ctx := context.Background()
+
+	if err := backend.Write(ctx, &WriteRequest{
+		FilePath: "/dotall.txt",
+		Content:  "start\nmiddle line\nend",
+	}); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	t.Run("single line mode keeps dot line-bound", func(t *testing.T) {
+		matches, err := backend.GrepRaw(ctx, &GrepRequest{
+			Pattern:         "start.*end",
+			EnableMultiline: false,
+		})
+		if err != nil {
+			t.Fatalf("GrepRaw failed: %v", err)
+		}
+		if len(matches) != 0 {
+			t.Errorf("Expected 0 matches in single-line mode, got %d", len(matches))
+		}
+	})
+
+	t.Run("multiline mode lets dot match newlines", func(t *testing.T) {
+		matches, err := backend.GrepRaw(ctx, &GrepRequest{
+			Pattern:         "start.*end",
+			EnableMultiline: true,
+		})
+		if err != nil {
+			t.Fatalf("GrepRaw failed: %v", err)
+		}
+		if len(matches) != 3 {
+			t.Fatalf("Expected 3 matching lines, got %d: %+v", len(matches), matches)
+		}
+		for i, match := range matches {
+			if match.Line != i+1 {
+				t.Errorf("Expected line %d, got %d (%q)", i+1, match.Line, match.Content)
+			}
+		}
+	})
+
+	t.Run("explicit (?-s) disables dotall in multiline mode", func(t *testing.T) {
+		matches, err := backend.GrepRaw(ctx, &GrepRequest{
+			Pattern:         `(?-s)start.*end`,
+			EnableMultiline: true,
+		})
+		if err != nil {
+			t.Fatalf("GrepRaw failed: %v", err)
+		}
+		if len(matches) != 0 {
+			t.Errorf("Expected 0 matches with explicit (?-s), got %d", len(matches))
+		}
+	})
+
+	t.Run("case insensitive and multiline combined", func(t *testing.T) {
+		if err := backend.Write(ctx, &WriteRequest{
+			FilePath: "/dotall-ci.txt",
+			Content:  "START\nmiddle\nEnd",
+		}); err != nil {
+			t.Fatalf("Write failed: %v", err)
+		}
+		matches, err := backend.GrepRaw(ctx, &GrepRequest{
+			Pattern:         "start.*end",
+			Path:            "/dotall-ci.txt",
+			EnableMultiline: true,
+			CaseInsensitive: true,
+		})
+		if err != nil {
+			t.Fatalf("GrepRaw failed: %v", err)
+		}
+		if len(matches) != 3 {
+			t.Errorf("Expected 3 matching lines, got %d", len(matches))
+		}
+	})
+}
+
 func TestInMemoryBackend_GrepRaw_Multiline(t *testing.T) {
 	backend := NewInMemoryBackend()
 	ctx := context.Background()
