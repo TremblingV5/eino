@@ -147,13 +147,23 @@ func forwardEventsAndAppendTransfer(iter *AsyncIterator[*AgentEvent],
 	}()
 
 	var lastEvent *AgentEvent
+	sourceErrored := false
 	for {
 		event, ok := iter.Next()
 		if !ok {
 			break
 		}
+		if event.Err != nil {
+			sourceErrored = true
+		}
 		generator.Send(event)
 		lastEvent = event
+	}
+
+	// Do not hand off to the next agent when the source agent failed, otherwise
+	// downstream agents would run on incomplete state after an upstream error.
+	if sourceErrored {
+		return
 	}
 
 	if lastEvent != nil && lastEvent.Action != nil && (lastEvent.Action.Interrupted != nil || lastEvent.Action.Exit) {
@@ -242,11 +252,16 @@ func handleFlowAgentEvents(ctx context.Context, iter *AsyncIterator[*AgentEvent]
 	}()
 
 	var lastEvent *AgentEvent
+	sourceErrored := false
 
 	for {
 		event, ok := iter.Next()
 		if !ok {
 			break
+		}
+
+		if event.Err != nil {
+			sourceErrored = true
 		}
 
 		if parentSession != nil && (event.Action == nil || event.Action.Interrupted == nil) {
@@ -278,6 +293,10 @@ func handleFlowAgentEvents(ctx context.Context, iter *AsyncIterator[*AgentEvent]
 		if lastEvent.Action.Exit {
 			return
 		}
+	}
+
+	if sourceErrored {
+		return
 	}
 
 	sendTransferEvents(generator, toAgentNames)

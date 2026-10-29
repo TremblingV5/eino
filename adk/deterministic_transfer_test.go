@@ -729,3 +729,72 @@ func TestDeterministicTransferNonResumableAgent(t *testing.T) {
 
 	assert.True(t, sawTransfer, "should see transfer event")
 }
+
+func TestDeterministicTransferStopsAfterSourceError(t *testing.T) {
+	ctx := context.Background()
+
+	newErrorAgent := func() *dtTestAgent {
+		return &dtTestAgent{
+			name: "source",
+			runFn: func(ctx context.Context, input *AgentInput, options ...AgentRunOption) *AsyncIterator[*AgentEvent] {
+				iter, gen := NewAsyncIteratorPair[*AgentEvent]()
+				go func() {
+					defer gen.Close()
+					gen.Send(&AgentEvent{Err: assert.AnError})
+				}()
+				return iter
+			},
+		}
+	}
+
+	t.Run("plain agent path", func(t *testing.T) {
+		wrapped := AgentWithDeterministicTransferTo(ctx, &DeterministicTransferConfig{
+			Agent:        newErrorAgent(),
+			ToAgentNames: []string{"next_agent"},
+		})
+
+		iter := wrapped.Run(ctx, &AgentInput{})
+		var sawErr, sawTransfer bool
+		for {
+			ev, ok := iter.Next()
+			if !ok {
+				break
+			}
+			if ev.Err != nil {
+				sawErr = true
+			}
+			if ev.Action != nil && ev.Action.TransferToAgent != nil {
+				sawTransfer = true
+			}
+		}
+
+		assert.True(t, sawErr, "source error should be forwarded")
+		assert.False(t, sawTransfer, "no transfer event should follow a source error")
+	})
+
+	t.Run("flow agent path", func(t *testing.T) {
+		wrapped := AgentWithDeterministicTransferTo(ctx, &DeterministicTransferConfig{
+			Agent:        toFlowAgent(ctx, newErrorAgent()),
+			ToAgentNames: []string{"next_agent"},
+		})
+
+		runner := NewRunner(ctx, RunnerConfig{Agent: wrapped})
+		iter := runner.Query(ctx, "test")
+		var sawErr, sawTransfer bool
+		for {
+			ev, ok := iter.Next()
+			if !ok {
+				break
+			}
+			if ev.Err != nil {
+				sawErr = true
+			}
+			if ev.Action != nil && ev.Action.TransferToAgent != nil {
+				sawTransfer = true
+			}
+		}
+
+		assert.True(t, sawErr, "source error should be forwarded")
+		assert.False(t, sawTransfer, "no transfer event should follow a source error")
+	})
+}
