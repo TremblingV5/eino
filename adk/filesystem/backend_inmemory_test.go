@@ -2495,3 +2495,64 @@ func TestInMemoryBackend_Read_NoLimit(t *testing.T) {
 		}
 	})
 }
+
+func TestInMemoryBackend_GrepRaw_MultilineLineProjection(t *testing.T) {
+	ctx := context.Background()
+
+	testCases := []struct {
+		name     string
+		content  string
+		pattern  string
+		wantLine []int
+	}{
+		{
+			name:     "repeated matches on the same line are emitted once",
+			content:  "hit hit\nunrelated",
+			pattern:  "hit",
+			wantLine: []int{1},
+		},
+		{
+			name:     "a match ending in a newline does not include the next line",
+			content:  "start\nend\nunrelated",
+			pattern:  "start\nend\n",
+			wantLine: []int{1, 2},
+		},
+		{
+			name:     "disjoint multiline matches keep all their lines",
+			content:  "a\nb\nc\nd",
+			pattern:  "a\nb|c\nd",
+			wantLine: []int{1, 2, 3, 4},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := NewInMemoryBackend()
+			if err := backend.Write(ctx, &WriteRequest{FilePath: "/notes", Content: tc.content}); err != nil {
+				t.Fatalf("Write failed: %v", err)
+			}
+
+			matches, err := backend.GrepRaw(ctx, &GrepRequest{
+				Path:            "/notes",
+				Pattern:         tc.pattern,
+				EnableMultiline: true,
+			})
+			if err != nil {
+				t.Fatalf("GrepRaw failed: %v", err)
+			}
+
+			got := make([]int, 0, len(matches))
+			for _, match := range matches {
+				got = append(got, match.Line)
+			}
+			if len(got) != len(tc.wantLine) {
+				t.Fatalf("got lines %v, want %v", got, tc.wantLine)
+			}
+			for i := range got {
+				if got[i] != tc.wantLine[i] {
+					t.Fatalf("got lines %v, want %v", got, tc.wantLine)
+				}
+			}
+		})
+	}
+}
