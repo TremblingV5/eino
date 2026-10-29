@@ -557,13 +557,13 @@ func (t *typedToolReductionMiddleware[M]) wrapDefaultStreamableTruncation(
 	//
 	// Source error after truncation:
 	//   input : C1 -------- C2(crosses limit) -------- C3 -------- ERR
-	//   output: C1 -------- [swallow C2,C3] ---------- replay(C2+C3 tail) -- ERR
+	//   output: C1 -------- [swallow C2,C3] ---------- prefix(C2)+notice -- ERR
 	//
 	// Before truncation, chunks are forwarded unchanged. Once the limit is reached,
 	// the wrapper keeps reading and accumulating full output but suppresses chunks.
 	// On clean EOF, it offloads full output and emits one final truncation notice.
-	// On source error, it replays the original content swallowed since the truncation
-	// point, then surfaces the original source error via the outer convert layer.
+	// On source error, it applies the same bounded truncation output so the limit
+	// still holds, then surfaces the original source error via the outer convert layer.
 	convertHandler := func(chunk string) (string, error) {
 		if chunk == "" {
 			return "", schema.ErrNoValue
@@ -598,13 +598,9 @@ func (t *typedToolReductionMiddleware[M]) wrapDefaultStreamableTruncation(
 	}
 
 	eofHandler := func() (any, error) {
-		if sourceErr != nil {
-			if fullOutput.Len() > curSize {
-				return fullOutput.String()[curSize:], nil
-			}
-			return nil, io.EOF
-		}
 		if !reachedLimit {
+			// Nothing was truncated. Any source error is surfaced by the outer
+			// reader below.
 			return nil, io.EOF
 		}
 		detail := &ToolDetail{
