@@ -44,3 +44,36 @@ func init() {
 	internal.RegisterStreamChunkConcatFunc(ConcatAgenticMessagesArray)
 	internal.RegisterStreamChunkConcatFunc(ConcatToolResults)
 }
+
+func buildConcatGenericArray[T any](f func([]*T) (*T, error)) func([][]*T) ([]*T, error) {
+	return func(mas [][]*T) ([]*T, error) {
+		arrayLen := len(mas[0])
+		ret := make([]*T, arrayLen)
+		slicesToConcat := make([][]*T, arrayLen)
+		for _, ma := range mas {
+			if len(ma) != arrayLen {
+				return nil, fmt.Errorf("unexpected array length. "+"Got %d, expected %d", len(ma), arrayLen)
+			}
+			for i := 0; i < arrayLen; i++ {
+				m := ma[i]
+				if m != nil {
+					slicesToConcat[i] = append(slicesToConcat[i], m)
+				}
+			}
+		}
+		for i, slice := range slicesToConcat {
+			if len(slice) == 0 {
+				ret[i] = nil
+			} else if len(slice) == 1 {
+				ret[i] = slice[0]
+			} else {
+				cm, err := f(slice)
+				if err != nil {
+					return nil, err
+				}
+				ret[i] = cm
+			}
+		}
+		return ret, nil
+	}
+}
