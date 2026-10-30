@@ -36,3 +36,11 @@ import (
 	"github.com/cloudwego/eino/internal"
 	"github.com/cloudwego/eino/internal/generic"
 )
+
+func init() {
+	internal.RegisterStreamChunkConcatFunc(ConcatMessages)
+	internal.RegisterStreamChunkConcatFunc(ConcatMessageArray)
+	internal.RegisterStreamChunkConcatFunc(ConcatAgenticMessages)
+	internal.RegisterStreamChunkConcatFunc(ConcatAgenticMessagesArray)
+	internal.RegisterStreamChunkConcatFunc(ConcatToolResults)
+}
