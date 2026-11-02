@@ -83,7 +83,7 @@ func GetSourceName(err error) (string, bool) {
 //		for i := 0; i < 10; i++ {
 //			sw.Send(i, nil)
 //		}
-//	}
+//	}()
 //
 //	defer sr.Close()
 //	for {
@@ -111,7 +111,7 @@ func Pipe[T any](cap int) (*StreamReader[T], *StreamWriter[T]) {
 //		for i := 0; i < 10; i++ {
 //			sw.Send(i, nil)
 //		}
-//	}
+//	}()
 type StreamWriter[T any] struct {
 	stm *stream[T]
 }
@@ -690,6 +690,13 @@ func WithOnEOF(fn func() (any, error)) ConvertOption {
 //	// Recv yields "val_1", "val_2", "val_3"
 func StreamReaderWithConvert[T, D any](sr *StreamReader[T], convert func(T) (D, error), opts ...ConvertOption) *StreamReader[D] {
 	c := func(a any) (D, error) {
+		// Handle nil interface input: a direct type assertion on a nil interface
+		// would panic because nil interfaces have no dynamic type. Instead,
+		// pass T's zero value to the converter when the input is nil.
+		if a == nil {
+			var zero T
+			return convert(zero)
+		}
 		return convert(a.(T))
 	}
 
