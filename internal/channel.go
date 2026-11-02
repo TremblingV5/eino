@@ -78,6 +78,10 @@ func (ch *UnboundedChan[T]) Receive() (T, bool) {
 	}
 
 	val := ch.buffer[0]
+	// Zero out the consumed element to allow GC to reclaim
+	// memory referenced by already-consumed values.
+	var zero T
+	ch.buffer[0] = zero
 	ch.buffer = ch.buffer[1:]
 	return val, true
 }
