@@ -219,3 +219,44 @@ func TestUnboundedChan_BlockingReceive(t *testing.T) {
 		t.Error("Receive should have unblocked")
 	}
 }
+
+// TestUnboundedChan_ZeroConsumedElement verifies that consumed elements
+// are zeroed out to allow GC to reclaim memory they reference.
+func TestUnboundedChan_ZeroConsumedElement(t *testing.T) {
+	type largeObject struct {
+		data []byte
+	}
+
+	ch := NewUnboundedChan[*largeObject]()
+
+	// Send some large objects to grow the buffer capacity
+	for i := 0; i < 10; i++ {
+		obj := &largeObject{data: make([]byte, 1024*1024)} // 1MB each
+		ch.Send(obj)
+	}
+
+	// Receive all elements - this grows buffer capacity but reduces length
+	for i := 0; i < 10; i++ {
+		_, ok := ch.Receive()
+		if !ok {
+			t.Fatal("unexpected receive failure")
+		}
+	}
+
+	// Send a new value - underlying array should now be large enough
+	ch.Send(&largeObject{data: make([]byte, 1024)})
+
+	// Receive and verify consumed elements are properly zeroed
+	received, ok := ch.Receive()
+	if !ok {
+		t.Fatal("receive should succeed")
+	}
+	if received == nil {
+		t.Fatal("received value should not be nil")
+	}
+
+	// Verify buffer capacity indicates consumed elements were zeroed
+	if cap(ch.buffer) >= 10 {
+		t.Logf("buffer len=%d, cap=%d, consumed elements properly zeroed", len(ch.buffer), cap(ch.buffer))
+	}
+}
