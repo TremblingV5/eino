@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -90,9 +91,11 @@ func listTasks(ctx context.Context, backend Backend, baseDir string) ([]*task, e
 		tasks = append(tasks, taskData)
 	}
 
-	// sort tasks by ID
+	// sort tasks by ID (numeric, not lexicographic)
 	sort.Slice(tasks, func(i, j int) bool {
-		return tasks[i].ID < tasks[j].ID
+		iNum, _ := strconv.Atoi(tasks[i].ID)
+		jNum, _ := strconv.Atoi(tasks[j].ID)
+		return iNum < jNum
 	})
 
 	return tasks, nil
