@@ -78,6 +78,8 @@ func (ch *UnboundedChan[T]) Receive() (T, bool) {
 	}
 
 	val := ch.buffer[0]
+	var zero T
+	ch.buffer[0] = zero // clear slot to prevent reference retention
 	ch.buffer = ch.buffer[1:]
 	return val, true
 }
