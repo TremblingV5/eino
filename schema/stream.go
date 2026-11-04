@@ -698,6 +698,15 @@ func StreamReaderWithConvert[T, D any](sr *StreamReader[T], convert func(T) (D, 
 
 func (srw *streamReaderWithConvert[T]) recv() (T, error) {
 	for {
+		// Once the EOF callback has been delivered, later Recv calls must
+		// return io.EOF without reading the source again. Otherwise an inner
+		// converter that reports EOF early could deliver trailing data after
+		// the outer callback's terminal value.
+		if srw.eofDone {
+			var t T
+			return t, io.EOF
+		}
+
 		out, err := srw.sr.recvAny()
 
 		if err != nil {
