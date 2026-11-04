@@ -1076,6 +1076,21 @@ func runToolCallTaskByStream(ctx context.Context, task *toolCallTask, opts ...to
 	}
 }
 
+// runToolCallTaskSafely executes a tool call task and converts any panic into a
+// task error at the task boundary. A panicking tool must not unwind the caller
+// before the remaining parallel tools have been joined.
+func runToolCallTaskSafely(ctx context.Context,
+	run func(ctx2 context.Context, callTask *toolCallTask, opts ...tool.Option),
+	t *toolCallTask, opts ...tool.Option) {
+	defer func() {
+		panicErr := recover()
+		if panicErr != nil {
+			t.err = safe.NewPanicErr(panicErr, debug.Stack())
+		}
+	}()
+	run(ctx, t, opts...)
+}
+
 func sequentialRunToolCall(ctx context.Context,
 	run func(ctx2 context.Context, callTask *toolCallTask, opts ...tool.Option),
 	tasks []toolCallTask, opts ...tool.Option) {
@@ -1084,7 +1099,7 @@ func sequentialRunToolCall(ctx context.Context,
 		if tasks[i].executed {
 			continue
 		}
-		run(ctx, &tasks[i], opts...)
+		runToolCallTaskSafely(ctx, run, &tasks[i], opts...)
 	}
 }
 
@@ -1093,7 +1108,7 @@ func parallelRunToolCall(ctx context.Context,
 	tasks []toolCallTask, opts ...tool.Option) {
 
 	if len(tasks) == 1 {
-		run(ctx, &tasks[0], opts...)
+		runToolCallTaskSafely(ctx, run, &tasks[0], opts...)
 		return
 	}
 
@@ -1105,18 +1120,12 @@ func parallelRunToolCall(ctx context.Context,
 		wg.Add(1)
 		go func(ctx_ context.Context, t *toolCallTask, opts ...tool.Option) {
 			defer wg.Done()
-			defer func() {
-				panicErr := recover()
-				if panicErr != nil {
-					t.err = safe.NewPanicErr(panicErr, debug.Stack())
-				}
-			}()
-			run(ctx_, t, opts...)
+			runToolCallTaskSafely(ctx_, run, t, opts...)
 		}(ctx, &tasks[i], opts...)
 	}
 
 	if !tasks[0].executed {
-		run(ctx, &tasks[0], opts...)
+		runToolCallTaskSafely(ctx, run, &tasks[0], opts...)
 	}
 
 	wg.Wait()
