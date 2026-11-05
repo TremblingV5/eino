@@ -76,7 +76,7 @@ func (e *RetryExhaustedError) Unwrap() error {
 //     occurs (not after restoring from checkpoint), skipping serialization is acceptable.
 //     After checkpoint restore, err will be nil and Unwrap() returns nil.
 //   - rejectReason (unexported): Stores a user-defined value set by the ShouldRetry callback
-//     via RetryDecision.RejectReason. This is runtime-only observability data â after checkpoint
+//     via RetryDecision.RejectReason. This is runtime-only observability data — after checkpoint
 //     restore it will be nil. Unexported to avoid Gob serialization of arbitrary types.
 type WillRetryError struct {
 	ErrStr       string
@@ -108,10 +108,10 @@ func init() {
 //
 // State combinations for OutputMessage and Err:
 //
-//	OutputMessage != nil, Err == nil  â successful call; inspect message quality
-//	OutputMessage == nil, Err != nil  â failed call (Generate error or Stream() error)
-//	OutputMessage != nil, Err != nil  â partial stream (chunks received before mid-stream error)
-//	OutputMessage == nil, Err == nil  â empty stream (zero chunks before EOF)
+//	OutputMessage != nil, Err == nil  → successful call; inspect message quality
+//	OutputMessage == nil, Err != nil  → failed call (Generate error or Stream() error)
+//	OutputMessage != nil, Err != nil  → partial stream (chunks received before mid-stream error)
+//	OutputMessage == nil, Err == nil  → empty stream (zero chunks before EOF)
 type TypedRetryContext[M MessageType] struct {
 	// RetryAttempt is the current retry attempt number (1-based).
 	// For the first retry decision (after the initial call), this is 1.
@@ -188,7 +188,7 @@ type TypedRetryDecision[M MessageType] struct {
 	// returns AdditionalOptions on every attempt, each set is appended to the previous ones.
 	// Only the last value for each option key takes effect, but earlier values remain in the slice.
 	// AdditionalOptions are scoped to the current retry cycle and do not persist to subsequent
-	// agent iterations â each new model call in the agent loop starts with the original options.
+	// agent iterations — each new model call in the agent loop starts with the original options.
 	// Only used when Retry is true. Ignored when Retry is false.
 	AdditionalOptions []model.Option
 
@@ -208,7 +208,7 @@ type TypedRetryDecision[M MessageType] struct {
 	//
 	// The ShouldRetry callback has full access to the model output (via retryCtx.OutputMessage)
 	// and error (via retryCtx.Err), so it can distill whatever information it wants into
-	// RejectReason â a string, a struct, the output message itself, or nil.
+	// RejectReason — a string, a struct, the output message itself, or nil.
 	//
 	// Only used when Retry is true. Ignored when Retry is false.
 	RejectReason any
@@ -545,7 +545,7 @@ func streamWithShouldRetry[M MessageType](r *typedRetryModelWrapper[M], ctx cont
 		if err != nil {
 			// Defensive no-op: when Stream() returns an error, no stream exists, so
 			// eventSenderModel never creates the StreamReaderWithConvert hooks that would
-			// read from signal.ch. This send has no consumer â it merely fills the
+			// read from signal.ch. This send has no consumer — it merely fills the
 			// buffered(1) slot so the panic-recovery defer (select/default) won't block
 			// if a later panic tries to send a second verdict. The signal is discarded
 			// when the next iteration creates a new one.
