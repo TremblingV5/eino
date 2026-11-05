@@ -1,759 +1,132 @@
-/*
- * Copyright 2025 CloudWeGo Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
-package adk
-
-import (
-	"context"
-	"errors"
-	"fmt"
-	"io"
-	"math/rand"
-	"time"
-
-	"github.com/cloudwego/eino/components/model"
-	"github.com/cloudwego/eino/compose"
-	"github.com/cloudwego/eino/schema"
-)
-
-var (
-	// ErrExceedMaxRetries is returned when the maximum number of retries has been exceeded.
-	// Use errors.Is to check if an error is due to max retries being exceeded:
-	//
-	//   if errors.Is(err, adk.ErrExceedMaxRetries) {
-	//       // handle max retries exceeded
-	//   }
-	//
-	// Use errors.As to extract the underlying RetryExhaustedError for the last error details:
-	//
-	//   var retryErr *adk.RetryExhaustedError
-	//   if errors.As(err, &retryErr) {
-	//       fmt.Printf("last error was: %v\n", retryErr.LastErr)
-	//   }
-	ErrExceedMaxRetries = errors.New("exceeds max retries")
-)
-
-// RetryExhaustedError is returned when all retry attempts have been exhausted.
-// It wraps the last error that occurred during retry attempts.
-type RetryExhaustedError struct {
-	LastErr      error
-	TotalRetries int
-}
-
-func (e *RetryExhaustedError) Error() string {
-	if e.LastErr != nil {
-		return fmt.Sprintf("exceeds max retries: last error: %v", e.LastErr)
-	}
-	return "exceeds max retries"
-}
-
-func (e *RetryExhaustedError) Unwrap() error {
-	return ErrExceedMaxRetries
-}
-
-// WillRetryError is emitted when a retryable error occurs and a retry will be attempted.
-// It allows end-users to observe retry events in real-time via AgentEvent.
-//
-// Field design rationale:
-//   - ErrStr (exported): Stores the error message string for Gob serialization during checkpointing.
-//     This ensures the error message is preserved after checkpoint restore.
-//   - err (unexported): Stores the original error for Unwrap() support at runtime.
-//     This field is intentionally unexported because Gob serialization would fail for unregistered
-//     concrete error types. Since end-users only need the original error when the AgentEvent first
-//     occurs (not after restoring from checkpoint), skipping serialization is acceptable.
-//     After checkpoint restore, err will be nil and Unwrap() returns nil.
-//   - rejectReason (unexported): Stores a user-defined value set by the ShouldRetry callback
-//     via RetryDecision.RejectReason. This is runtime-only observability data — after checkpoint
-//     restore it will be nil. Unexported to avoid Gob serialization of arbitrary types.
-type WillRetryError struct {
-	ErrStr       string
-	RetryAttempt int
-	rejectReason any
-	err          error
-}
-
-func (e *WillRetryError) Error() string {
-	return e.ErrStr
-}
-
-func (e *WillRetryError) Unwrap() error {
-	return e.err
-}
-
-// RejectReason returns the user-defined rejection reason set by the ShouldRetry callback
-// via RetryDecision.RejectReason. Returns nil if not set or after checkpoint restore.
-func (e *WillRetryError) RejectReason() any {
-	return e.rejectReason
-}
-
-func init() {
-	schema.RegisterName[*WillRetryError]("eino_adk_chatmodel_will_retry_error")
-}
-
-// TypedRetryContext contains context information passed to TypedModelRetryConfig.ShouldRetry
-// during a retry decision.
-//
-// State combinations for OutputMessage and Err:
-//
-//	OutputMessage != nil, Err == nil  → successful call; inspect message quality
-//	OutputMessage == nil, Err != nil  → failed call (Generate error or Stream() error)
-//	OutputMessage != nil, Err != nil  → partial stream (chunks received before mid-stream error)
-//	OutputMessage == nil, Err == nil  → empty stream (zero chunks before EOF)
-type TypedRetryContext[M MessageType] struct {
-	// RetryAttempt is the current retry attempt number (1-based).
-	// For the first retry decision (after the initial call), this is 1.
-	RetryAttempt int
-
-	// InputMessages is the input messages that were sent to the model for the current attempt.
-	InputMessages []M
-
-	// Options is the model options that were used for the current attempt.
-	Options []model.Option
-
-	// OutputMessage is the output message from the model, if any.
-	// This is non-nil when the model returned a message successfully.
-	// For streaming, this is the fully concatenated message (the entire stream is consumed
-	// before ShouldRetry is called).
-	// For streaming with mid-stream errors, this is the partial concatenation of chunks
-	// received before the error occurred.
-	// May be nil if the model returned an error without producing a message, or if the
-	// stream was empty (zero chunks before EOF).
-	OutputMessage M
-
-	// Err is the error from the model call, if any.
-	// May be nil if the model produced a message without error.
-	// Note: both OutputMessage and Err can be nil simultaneously for empty streams.
-	Err error
-}
-
-// RetryContext is the default retry context type using *schema.Message.
-type RetryContext = TypedRetryContext[*schema.Message]
-
-// TypedRetryDecision represents the decision made by TypedModelRetryConfig.ShouldRetry.
-type TypedRetryDecision[M MessageType] struct {
-	// Retry indicates whether the model call should be retried.
-	// If false, the model output (or error) is accepted as-is, unless RewriteError is set.
-	Retry bool
-
-	// RewriteError, when non-nil, overrides the return value of the model call with this error.
-	// The agent run will fail with this error.
-	//
-	// This is useful for two scenarios:
-	//   - When the model returns a "seemingly correct" message (no error) that actually
-	//     contains unrecoverable issues. RewriteError converts the successful output
-	//     into a fatal error.
-	//   - When the model returns an error, but you want to replace it with a different,
-	//     more descriptive error (e.g., adding context or wrapping).
-	//
-	// When Retry is true, RewriteError is ignored.
-	// When Retry is false and RewriteError is non-nil, the model call returns
-	// RewriteError regardless of whether the original call had an error or a message.
-	RewriteError error
-
-	// ModifiedInputMessages, when non-nil, replaces the input messages for the next retry.
-	//
-	// This enables advanced recovery strategies like context compression or message trimming.
-	// Only used when Retry is true. Ignored when Retry is false.
-	ModifiedInputMessages []M
-
-	// PersistModifiedInputMessages controls whether ModifiedInputMessages are written
-	// back to the agent's conversation history, affecting subsequent model calls in
-	// the agent loop (not just the next retry attempt).
-	//
-	// When true, the modified messages replace the current conversation history.
-	// When false (default), the modified messages are only used for the next retry attempt
-	// within this retry cycle.
-	//
-	// Only used when Retry is true and ModifiedInputMessages is non-nil.
-	PersistModifiedInputMessages bool
-
-	// AdditionalOptions, when non-nil, provides additional model options for the next retry.
-	// These options are appended to the existing options, taking precedence via last-wins semantics.
-	//
-	// This enables adjustments like increasing MaxTokens for the retry attempt.
-	// Note: options accumulate across retries within a single retry cycle. If ShouldRetry
-	// returns AdditionalOptions on every attempt, each set is appended to the previous ones.
-	// Only the last value for each option key takes effect, but earlier values remain in the slice.
-	// AdditionalOptions are scoped to the current retry cycle and do not persist to subsequent
-	// agent iterations — each new model call in the agent loop starts with the original options.
-	// Only used when Retry is true. Ignored when Retry is false.
-	AdditionalOptions []model.Option
-
-	// Backoff specifies the duration to wait before the next retry attempt.
-	// If zero, the default backoff function (from ModelRetryConfig.BackoffFunc or the
-	// built-in exponential backoff) is used.
-	//
-	// This allows the ShouldRetry callback to dynamically control retry timing based on
-	// the specific error or problematic message encountered.
-	// Only used when Retry is true. Ignored when Retry is false.
-	Backoff time.Duration
-
-	// RejectReason is an optional user-defined value describing why the output was rejected.
-	// When Retry is true and the rejected stream/message is observed downstream via
-	// AgentEvent, this value is attached to the WillRetryError emitted to the event stream.
-	// Consumers can retrieve it via WillRetryError.RejectReason().
-	//
-	// The ShouldRetry callback has full access to the model output (via retryCtx.OutputMessage)
-	// and error (via retryCtx.Err), so it can distill whatever information it wants into
-	// RejectReason — a string, a struct, the output message itself, or nil.
-	//
-	// Only used when Retry is true. Ignored when Retry is false.
-	RejectReason any
-}
-
-// RetryDecision is the default retry decision type using *schema.Message.
-type RetryDecision = TypedRetryDecision[*schema.Message]
-
-// TypedModelRetryConfig configures retry behavior for the ChatModel node.
-// It defines how the agent should handle transient failures when calling the ChatModel.
-type TypedModelRetryConfig[M MessageType] struct {
-	// MaxRetries specifies the maximum number of retry attempts.
-	// A value of 0 means no retries will be attempted.
-	// A value of 3 means up to 3 retry attempts (4 total calls including the initial attempt).
-	MaxRetries int
-
-	// ShouldRetry determines how to handle a model call result.
-	// It receives context information about the current attempt including the output message
-	// and/or error, and returns a decision on whether to retry, what to modify, etc.
-	// Returning nil is treated as &RetryDecision{Retry: false} (accept as-is).
-	//
-	// If nil, defaults to retrying on any non-nil error (backward compatible with IsRetryAble).
-	//
-	// Note: When ShouldRetry is set, IsRetryAble is ignored.
-	// Note: In streaming mode, the entire stream is consumed before ShouldRetry is called.
-	// The event stream is sent to the client in real time regardless; only the retry
-	// decision is deferred until the full response is available.
-	ShouldRetry func(ctx context.Context, retryCtx *TypedRetryContext[M]) *TypedRetryDecision[M]
-
-	// Deprecated: Use ShouldRetry instead for richer retry control including message
-	// inspection, input modification, and option adjustment. When ShouldRetry is set,
-	// IsRetryAble is ignored.
-	IsRetryAble func(ctx context.Context, err error) bool
-
-	// BackoffFunc calculates the delay before the next retry attempt.
-	// The attempt parameter starts at 1 for the first retry.
-	// Used as the default when RetryDecision.Backoff is zero.
-	// If nil, a default exponential backoff with jitter is used:
-	// base delay 100ms, exponentially increasing up to 10s max,
-	// with random jitter (0-50% of delay) to prevent thundering herd.
-	BackoffFunc func(ctx context.Context, attempt int) time.Duration
-}
-
-// ModelRetryConfig is the default retry config type using *schema.Message.
-type ModelRetryConfig = TypedModelRetryConfig[*schema.Message]
-
-func defaultIsRetryAble(_ context.Context, err error) bool {
-	return err != nil
-}
-
-func defaultBackoff(_ context.Context, attempt int) time.Duration {
-	baseDelay := 100 * time.Millisecond
-	maxDelay := 10 * time.Second
-
-	if attempt <= 0 {
-		return baseDelay
-	}
-
-	if attempt > 7 {
-		return maxDelay + time.Duration(rand.Int63n(int64(maxDelay/2)))
-	}
-
-	delay := baseDelay * time.Duration(1<<uint(attempt-1))
-	if delay > maxDelay {
-		delay = maxDelay
-	}
-
-	jitter := time.Duration(rand.Int63n(int64(delay / 2)))
-	return delay + jitter
-}
-
-func genErrWrapper(ctx context.Context, maxRetries, attempt int, isRetryAbleFunc func(ctx context.Context, err error) bool) func(error) error {
-	return func(err error) error {
-		isRetryAble := isRetryAbleFunc == nil || isRetryAbleFunc(ctx, err)
-		hasRetriesLeft := attempt < maxRetries
-
-		if isRetryAble && hasRetriesLeft {
-			return &WillRetryError{ErrStr: err.Error(), RetryAttempt: attempt, err: err}
-		}
-		return err
-	}
-}
-
-func consumeStreamForError[M any](stream *schema.StreamReader[M]) error {
-	defer stream.Close()
-	for {
-		_, err := stream.Recv()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-	}
-}
-
-type retryVerdictSignal struct {
-	ch chan retryVerdict
-}
-
-type retryVerdict struct {
-	WillRetry    bool
-	RetryAttempt int
-	Err          error
-	RejectReason any
-}
-
-// retryModelWrapper wraps a BaseChatModel with retry logic.
-// This is used inside the model wrapper chain, positioned between eventSenderModelWrapper
-// and stateModelWrapper, so that retry only affects the inner chain (event sending, user wrappers,
-// callback injection) without re-running state management (BeforeModelRewriteState/AfterModelRewriteState).
-type typedRetryModelWrapper[M MessageType] struct {
-	inner  model.BaseModel[M]
-	config *TypedModelRetryConfig[M]
-}
-
-func newTypedRetryModelWrapper[M MessageType](inner model.BaseModel[M], config *TypedModelRetryConfig[M]) *typedRetryModelWrapper[M] {
-	return &typedRetryModelWrapper[M]{inner: inner, config: config}
-}
-
-func (r *typedRetryModelWrapper[M]) Generate(ctx context.Context, input []M, opts ...model.Option) (M, error) {
-	if r.config.ShouldRetry != nil {
-		return generateWithShouldRetry(r, ctx, input, opts...)
-	}
-	return r.generateLegacy(ctx, input, opts...)
-}
-
-func (r *typedRetryModelWrapper[M]) generateLegacy(ctx context.Context, input []M, opts ...model.Option) (zero M, _ error) {
-	isRetryAble := r.config.IsRetryAble
-	if isRetryAble == nil {
-		isRetryAble = defaultIsRetryAble
-	}
-	backoffFunc := r.config.BackoffFunc
-	if backoffFunc == nil {
-		backoffFunc = defaultBackoff
-	}
-
-	var lastErr error
-	for attempt := 0; attempt <= r.config.MaxRetries; attempt++ {
-		out, err := r.inner.Generate(ctx, input, opts...)
-		if err == nil {
-			return out, nil
-		}
-
-		if _, ok := compose.ExtractInterruptInfo(err); ok {
-			return zero, err
-		}
-
-		if errors.Is(err, ErrStreamCanceled) {
-			return zero, err
-		}
-
-		if !isRetryAble(ctx, err) {
-			return zero, err
-		}
-
-		lastErr = err
-		if attempt < r.config.MaxRetries {
-			if err := r.contextAwareSleep(ctx, backoffFunc(ctx, attempt+1)); err != nil {
-				return zero, err
-			}
-		}
-	}
-
-	return zero, &RetryExhaustedError{LastErr: lastErr, TotalRetries: r.config.MaxRetries}
-}
-
-func generateWithShouldRetry[M MessageType](r *typedRetryModelWrapper[M], ctx context.Context, input []M, opts ...model.Option) (M, error) {
-	backoffFunc := r.config.BackoffFunc
-	if backoffFunc == nil {
-		backoffFunc = defaultBackoff
-	}
-
-	execCtx := getTypedChatModelAgentExecCtx[M](ctx)
-
-	currentInput := input
-	currentOpts := opts
-	var lastErr error
-	var zero M
-
-	defer func() {
-		_ = compose.ProcessState(ctx, func(_ context.Context, st *typedState[M]) error {
-			st.setRetryAttempt(0)
-			return nil
-		})
-	}()
-
-	for attempt := 0; attempt <= r.config.MaxRetries; attempt++ {
-		_ = compose.ProcessState(ctx, func(_ context.Context, st *typedState[M]) error {
-			st.setRetryAttempt(attempt)
-			return nil
-		})
-
-		// Suppress event sending during Generate: the ShouldRetry callback must decide whether
-		// to accept or reject the result before any event is emitted. If accepted, the event
-		// is sent explicitly below (lines after decision check). If rejected, no event leaks.
-		if execCtx != nil {
-			execCtx.suppressEventSend = true
-		}
-		out, err := r.inner.Generate(ctx, currentInput, currentOpts...)
-		if execCtx != nil {
-			execCtx.suppressEventSend = false
-		}
-
-		if err != nil {
-			if _, ok := compose.ExtractInterruptInfo(err); ok {
-				return zero, err
-			}
-
-			if errors.Is(err, ErrStreamCanceled) {
-				return zero, err
-			}
-		}
-
-		retryCtx := &TypedRetryContext[M]{
-			RetryAttempt:  attempt + 1,
-			InputMessages: currentInput,
-			Options:       currentOpts,
-			OutputMessage: out,
-			Err:           err,
-		}
-		decision := r.config.ShouldRetry(ctx, retryCtx)
-		if decision == nil {
-			decision = &TypedRetryDecision[M]{}
-		}
-
-		if !decision.Retry {
-			if decision.RewriteError != nil {
-				return zero, decision.RewriteError
-			}
-			if err != nil {
-				return zero, err
-			}
-			if execCtx != nil && execCtx.generator != nil && out != nil {
-				event := typedModelOutputEvent(out, nil)
-				execCtx.send(event)
-			}
-			return out, nil
-		}
-
-		lastErr = err
-		if lastErr == nil {
-			lastErr = fmt.Errorf("model output rejected by ShouldRetry at attempt %d", attempt+1)
-		}
-
-		if attempt >= r.config.MaxRetries {
-			break
-		}
-
-		applyDecisionForRetry(&currentInput, &currentOpts, ctx, decision)
-
-		delay := decision.Backoff
-		if delay == 0 {
-			delay = backoffFunc(ctx, attempt+1)
-		}
-
-		if err := r.contextAwareSleep(ctx, delay); err != nil {
-			return zero, err
-		}
-	}
-
-	return zero, &RetryExhaustedError{LastErr: lastErr, TotalRetries: r.config.MaxRetries}
-}
-
-func (r *typedRetryModelWrapper[M]) contextAwareSleep(ctx context.Context, delay time.Duration) error {
-	if delay <= 0 {
-		return nil
-	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(delay):
-		return nil
-	}
-}
-
-func streamWithShouldRetry[M MessageType](r *typedRetryModelWrapper[M], ctx context.Context, input []M, opts ...model.Option) (
-	*schema.StreamReader[M], error) {
-
-	backoffFunc := r.config.BackoffFunc
-	if backoffFunc == nil {
-		backoffFunc = defaultBackoff
-	}
-
-	defer func() {
-		_ = compose.ProcessState(ctx, func(_ context.Context, st *typedState[M]) error {
-			st.setRetryAttempt(0)
-			return nil
-		})
-	}()
-
-	execCtx := getTypedChatModelAgentExecCtx[M](ctx)
-
-	currentInput := input
-	currentOpts := opts
-	var lastErr error
-	var curSignal *retryVerdictSignal
-
-	// Panic recovery for verdict signal: if ShouldRetry panics, the onEOF/errWrapper closures in
-	// buildStreamConvertOptions will block forever on signal.ch, causing a goroutine leak. This
-	// defer ensures a verdict is always sent, even on panic, before re-panicking.
-	defer func() {
-		if p := recover(); p != nil {
-			if curSignal != nil {
-				select {
-				case curSignal.ch <- retryVerdict{WillRetry: false, Err: fmt.Errorf("panic: %v", p)}:
-				default:
-				}
-			}
-			panic(p)
-		}
-	}()
-
-	for attempt := 0; attempt <= r.config.MaxRetries; attempt++ {
-		_ = compose.ProcessState(ctx, func(_ context.Context, st *typedState[M]) error {
-			st.setRetryAttempt(attempt)
-			return nil
-		})
-
-		signal := &retryVerdictSignal{ch: make(chan retryVerdict, 1)}
-		curSignal = signal
-		if execCtx != nil {
-			execCtx.retryVerdictSignal = signal
-		}
-
-		stream, err := r.inner.Stream(ctx, currentInput, currentOpts...)
-		if err != nil {
-			// Defensive no-op: when Stream() returns an error, no stream exists, so
-			// eventSenderModel never creates the StreamReaderWithConvert hooks that would
-			// read from signal.ch. This send has no consumer — it merely fills the
-			// buffered(1) slot so the panic-recovery defer (select/default) won't block
-			// if a later panic tries to send a second verdict. The signal is discarded
-			// when the next iteration creates a new one.
-			signal.ch <- retryVerdict{WillRetry: false}
-
-			if _, ok := compose.ExtractInterruptInfo(err); ok {
-				return nil, err
-			}
-
-			if errors.Is(err, ErrStreamCanceled) {
-				return nil, err
-			}
-
-			retryCtx := &TypedRetryContext[M]{
-				RetryAttempt:  attempt + 1,
-				InputMessages: currentInput,
-				Options:       currentOpts,
-				Err:           err,
-			}
-			decision := r.config.ShouldRetry(ctx, retryCtx)
-			if decision == nil {
-				decision = &TypedRetryDecision[M]{}
-			}
-
-			if !decision.Retry {
-				if decision.RewriteError != nil {
-					return nil, decision.RewriteError
-				}
-				return nil, err
-			}
-
-			lastErr = err
-			if attempt < r.config.MaxRetries {
-				applyDecisionForRetry(&currentInput, &currentOpts, ctx, decision)
-				delay := decision.Backoff
-				if delay == 0 {
-					delay = backoffFunc(ctx, attempt+1)
-				}
-				if err := r.contextAwareSleep(ctx, delay); err != nil {
-					return nil, err
-				}
-			}
-			continue
-		}
-
-		// Split the stream: checkCopy is consumed synchronously here to build the complete
-		// message for ShouldRetry inspection; returnCopy is returned to the caller and may
-		// already be consumed downstream in parallel. The verdict signal bridges the two:
-		// once ShouldRetry decides, the signal tells returnCopy's errWrapper/onEOF whether
-		// to pass through normally or inject a WillRetryError.
-		copies := stream.Copy(2)
-		checkCopy := copies[0]
-		returnCopy := copies[1]
-
-		msg, streamErr := typedConsumeStream(checkCopy)
-
-		if errors.Is(streamErr, ErrStreamCanceled) {
-			signal.ch <- retryVerdict{WillRetry: false}
-			returnCopy.Close()
-			return nil, streamErr
-		}
-
-		retryCtx := &TypedRetryContext[M]{
-			RetryAttempt:  attempt + 1,
-			InputMessages: currentInput,
-			Options:       currentOpts,
-			OutputMessage: msg,
-			Err:           streamErr,
-		}
-		decision := r.config.ShouldRetry(ctx, retryCtx)
-		if decision == nil {
-			decision = &TypedRetryDecision[M]{}
-		}
-
-		if !decision.Retry {
-			signal.ch <- retryVerdict{WillRetry: false}
-
-			if decision.RewriteError != nil {
-				returnCopy.Close()
-				return nil, decision.RewriteError
-			}
-			if streamErr != nil {
-				returnCopy.Close()
-				return nil, streamErr
-			}
-			return returnCopy, nil
-		}
-
-		verdictErr := streamErr
-		if verdictErr == nil {
-			verdictErr = fmt.Errorf("model output rejected by ShouldRetry at attempt %d", attempt+1)
-		}
-		signal.ch <- retryVerdict{
-			WillRetry:    true,
-			RetryAttempt: attempt,
-			Err:          verdictErr,
-			RejectReason: decision.RejectReason,
-		}
-		returnCopy.Close()
-
-		lastErr = verdictErr
-
-		if attempt < r.config.MaxRetries {
-			applyDecisionForRetry(&currentInput, &currentOpts, ctx, decision)
-			delay := decision.Backoff
-			if delay == 0 {
-				delay = backoffFunc(ctx, attempt+1)
-			}
-			if err := r.contextAwareSleep(ctx, delay); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	return nil, &RetryExhaustedError{LastErr: lastErr, TotalRetries: r.config.MaxRetries}
-}
-
-func applyDecisionForRetry[M MessageType](currentInput *[]M, currentOpts *[]model.Option, ctx context.Context, decision *TypedRetryDecision[M]) {
-	if decision.ModifiedInputMessages != nil {
-		*currentInput = decision.ModifiedInputMessages
-		if decision.PersistModifiedInputMessages {
-			modifiedInput := *currentInput
-			_ = compose.ProcessState(ctx, func(_ context.Context, st *typedState[M]) error {
-				st.Messages = modifiedInput
-				return nil
-			})
-		}
-	}
-
-	if decision.AdditionalOptions != nil {
-		cloned := make([]model.Option, len(*currentOpts), len(*currentOpts)+len(decision.AdditionalOptions))
-		copy(cloned, *currentOpts)
-		*currentOpts = append(cloned, decision.AdditionalOptions...)
-	}
-}
-
-func (r *typedRetryModelWrapper[M]) Stream(ctx context.Context, input []M, opts ...model.Option) (
-	*schema.StreamReader[M], error) {
-
-	if r.config.ShouldRetry != nil {
-		return streamWithShouldRetry(r, ctx, input, opts...)
-	}
-	return r.streamLegacy(ctx, input, opts...)
-}
-
-func (r *typedRetryModelWrapper[M]) streamLegacy(ctx context.Context, input []M, opts ...model.Option) (
-	*schema.StreamReader[M], error) {
-
-	isRetryAble := r.config.IsRetryAble
-	if isRetryAble == nil {
-		isRetryAble = defaultIsRetryAble
-	}
-	backoffFunc := r.config.BackoffFunc
-	if backoffFunc == nil {
-		backoffFunc = defaultBackoff
-	}
-
-	defer func() {
-		_ = compose.ProcessState(ctx, func(_ context.Context, st *typedState[M]) error {
-			st.setRetryAttempt(0)
-			return nil
-		})
-	}()
-
-	var lastErr error
-	for attempt := 0; attempt <= r.config.MaxRetries; attempt++ {
-		_ = compose.ProcessState(ctx, func(_ context.Context, st *typedState[M]) error {
-			st.setRetryAttempt(attempt)
-			return nil
-		})
-
-		stream, err := r.inner.Stream(ctx, input, opts...)
-		if err != nil {
-			if _, ok := compose.ExtractInterruptInfo(err); ok {
-				return nil, err
-			}
-			if errors.Is(err, ErrStreamCanceled) {
-				return nil, err
-			}
-			if !isRetryAble(ctx, err) {
-				return nil, err
-			}
-			lastErr = err
-			if attempt < r.config.MaxRetries {
-				if err := r.contextAwareSleep(ctx, backoffFunc(ctx, attempt+1)); err != nil {
-					return nil, err
-				}
-			}
-			continue
-		}
-
-		copies := stream.Copy(2)
-		checkCopy := copies[0]
-		returnCopy := copies[1]
-
-		streamErr := consumeStreamForError(checkCopy)
-		if streamErr == nil {
-			return returnCopy, nil
-		}
-
-		returnCopy.Close()
-		if errors.Is(streamErr, ErrStreamCanceled) {
-			return nil, streamErr
-		}
-		if !isRetryAble(ctx, streamErr) {
-			return nil, streamErr
-		}
-
-		lastErr = streamErr
-		if attempt < r.config.MaxRetries {
-			if err := r.contextAwareSleep(ctx, backoffFunc(ctx, attempt+1)); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	return nil, &RetryExhaustedError{LastErr: lastErr, TotalRetries: r.config.MaxRetries}
-}
+²r«iË^®ËkºwµçK\\ÜHÛÛKËÈXÚÛÙ[ÈØ[Ý[]\ÈH[^HYÜHH^]H][\KËÈH][\\[Y]\Ý\È]HÜH\Ý]KKËÈ\ÙY\ÈHY][Ú[]QXÚ\Ú[ÛXÚÛÙ\È\ËKËÈY[HY][^Û[X[XÚÛÙÚ]]\\È\ÙYKËÈ\ÙH[^HL\Ë^Û[X[H[ÜX\Ú[È\ÈLÈX^KËÈÚ][ÛH]\
+ML	HÙ[^JHÈ][[\[È\PXÚÛÙ[È[ÊÝÛÛ^ÛÛ^][\[
+H[YK\][ÛBËÈ[Ù[]PÛÛYÈ\ÈHY][]HÛÛYÈ\H\Ú[È
+ØÚ[XKY\ÜØYÙK\H[Ù[]PÛÛYÈH\Y[Ù[]PÛÛYÖÊØÚ[XKY\ÜØYÙWB[ÈY][\Ô]PXJÈÛÛ^ÛÛ^\\ÜHÛÛÂ\]\\OH[B[ÈY][XÚÛÙÈÛÛ^ÛÛ^][\[
+H[YK\][ÛÂX\ÙQ[^HHL
+[YKZ[\ÙXÛÛ[X^[^HHL
+[YKÙXÛÛZY][\HÂB\]\\ÙQ[^B_BZY][\ÈÂB\]\X^[^H
+È[YK\][Û[[Û[
+X^[^KÌJJB_BY[^HH\ÙQ[^H
+[YK\][ÛOZ[
+][\LJJBZY[^HX^[^HÂBY[^HHX^[^B_BZ]\H[YK\][Û[[Û[
+[^HÈJJB\]\[^H
+È]\B[ÈÙ[\Ü\\ÝÛÛ^ÛÛ^X^]Y\Ë][\[\Ô]PXQ[È[ÊÝÛÛ^ÛÛ^\\ÜHÛÛ
+H[Ê\ÜH\ÜÂ\]\[Ê\\ÜH\ÜÂBKËÈHÜ\[\\[Û\ÈHÛÛÛYÝÈÚYÛ[ÝH]XXHZ[\KBKËÈ]\Ü\]\ÈÚ[]Q\ÜÝ\Ú\ÙHH][ÝX[HÛÝ[[Ý[ÙBBKËÈH]H]Ø[Ý\[[H[\\[ÛÛÝ[ÜÙH]ÈYX[[ËBZYËÚÈHÛÛ\ÜÙK^XÝ[\\[Ê\NÈÚÈÂBB\]\\B_BBZ\Ô]PXHH\Ô]PXQ[ÈOH[\Ô]PXQ[ÊÝ\BBZ\Ô]Y\ÓYH][\X^]Y\ÂBZY\Ô]PXH	\Ô]Y\ÓYÂBB\]\	Ú[]Q\ÜÑ\Ý\\Ü
+K]P][\][\\\BB_BB\]\\_BB[ÈÛÛÝ[YTÝX[QÜ\ÜÓH[WJÝX[H
+ØÚ[XKÝX[TXY\ÓWJH\ÜÂYY\ÝX[KÛÜÙJ
+BYÜÂBWË\HÝX[KXÝ
+BBZY\OH[ËSÑÂBB\]\[B_BBZY\OH[ÂBB\]\\B_B_BB\H]U\XÝÚYÛ[ÝXÝÂXÚÚ[]U\XÝB\H]U\XÝÝXÝÂUÚ[]HÛÛT]P][\[Q\\ÜTZXÝX\ÛÛ[BBËÈ]S[Ù[Ü\\Ü\ÈH\ÙPÚ][Ù[Ú]]HÙÚXËËÈ\È\È\ÙY[ÚYHH[Ù[Ü\\ÚZ[ÜÚ][ÛY]ÙY[][Ù[\[Ù[Ü\\ËÈ[Ý]S[Ù[Ü\\ÛÈ]]HÛHYXÝÈH[\ÚZ[
+][Ù[[Ë\Ù\Ü\\ËËÈØ[XÚÈ[XÝ[ÛHÚ]Ý]K\[[ÈÝ]HX[YÙ[Y[
+YÜS[Ù[]Ü]TÝ]KÐY\[Ù[]Ü]TÝ]JK\H\Y]S[Ù[Ü\\ÓHY\ÜØYÙU\WHÝXÝÂZ[\[Ù[\ÙS[Ù[ÓWBXÛÛYÈ
+\Y[Ù[]PÛÛYÖÓWBB[È]Õ\Y]S[Ù[Ü\\ÓHY\ÜØYÙU\WJ[\[Ù[\ÙS[Ù[ÓWKÛÛYÈ
+\Y[Ù[]PÛÛYÖÓWJH
+\Y]S[Ù[Ü\\ÓWHÂ\]\	\Y]S[Ù[Ü\\ÓW^Ú[\[\ÛÛYÎÛÛYßBB[È
+
+\Y]S[Ù[Ü\\ÓWJHÙ[\]JÝÛÛ^ÛÛ^[]×SKÜÈ[Ù[Ü[ÛH
+K\ÜHÂZYÛÛYËÚÝ[]HOH[ÂB\]\Ù[\]UÚ]ÚÝ[]JÝ[]ÜËB_B\]\Ù[\]SYØXÞJÝ[]ÜËBB[È
+
+\Y]S[Ù[Ü\\ÓWJHÙ[\]SYØXÞJÝÛÛ^ÛÛ^[]×SKÜÈ[Ù[Ü[ÛH
+\ÈKÈ\ÜHÂZ\Ô]PXHHÛÛYË\Ô]PXBZY\Ô]PXHOH[ÂBZ\Ô]PXHHY][\Ô]PXB_BXXÚÛÙ[ÈHÛÛYËXÚÛÙ[ÂZYXÚÛÙ[ÈOH[ÂBXXÚÛÙ[ÈHY][XÚÛÙ_B]\\Ý\\ÜYÜ][\HÈ][\HÛÛYËX^]Y\ÎÈ][\
+ÊÈÂB[Ý]\H[\Ù[\]JÝ[]ÜËBBZY\OH[ÂBB\]\Ý][B_BBZYËÚÈHÛÛ\ÜÙK^XÝ[\\[Ê\NÈÚÈÂBB\]\\Ë\B_BBZY\ÜË\Ê\\ÝX[PØ[Ù[Y
+HÂBB\]\\Ë\B_BBZYZ\Ô]PXJÝ\HÂBB\]\\Ë\B_BB[\Ý\H\BZY][\ÛÛYËX^]Y\ÈÂBBZY\HÛÛ^]Ø\TÛY\
+ÝXÚÛÙ[ÊÝ][\
+ÌJJNÈ\OH[ÂBBB\]\\Ë\BB_BB_B_B\]\\Ë	]Q^]\ÝY\ÜÓ\Ý\\Ý\Ý[]Y\ÎÛÛYËX^]Y\ßBB[ÈÙ[\]UÚ]ÚÝ[]VÓHY\ÜØYÙU\WJ
+\Y]S[Ù[Ü\\ÓWKÝÛÛ^ÛÛ^[]×SKÜÈ[Ù[Ü[ÛH
+K\ÜHÂXXÚÛÙ[ÈHÛÛYËXÚÛÙ[ÂZYXÚÛÙ[ÈOH[ÂBXXÚÛÙ[ÈHY][XÚÛÙ_BY^XÐÝHÙ]\YÚ][Ù[YÙ[^XÐÝÓWJÝ
+BXÝ\[[]H[]XÝ\[ÜÈHÜÂ]\\Ý\\Ü]\\ÈBYY\[Ê
+HÂBWÈHÛÛ\ÜÙKØÙ\ÜÔÝ]JÝ[ÊÈÛÛ^ÛÛ^Ý
+\YÝ]VÓWJH\ÜÂBB\ÝÙ]]P][\
+
+BBB\]\[B_JB_J
+BYÜ][\HÈ][\HÛÛYËX^]Y\ÎÈ][\
+ÊÈÂBWÈHÛÛ\ÜÙKØÙ\ÜÔÝ]JÝ[ÊÈÛÛ^ÛÛ^Ý
+\YÝ]VÓWJH\ÜÂBB\ÝÙ]]P][\
+][\
+BBB\]\[B_JBBKËÈÝ\\ÜÈ][Ù[[È\[ÈÙ[\]NHÚÝ[]HØ[XÚÈ]\ÝXÚYHÚ]\BKËÈÈXØÙ\ÜZXÝH\Ý[YÜH[H][\È[Z]YYXØÙ\YH][BKËÈ\ÈÙ[^XÚ]H[ÝÈ
+[\ÈY\XÚ\Ú[ÛÚXÚÊKYZXÝYÈ][XZÜËBZY^XÐÝOH[ÂBBY^XÐÝÝ\\ÜÑ][Ù[HYBB_BB[Ý]\H[\Ù[\]JÝÝ\[[]Ý\[ÜËBBZY^XÐÝOH[ÂBBY^XÐÝÝ\\ÜÑ][Ù[H[ÙBB_BBZY\OH[ÂBBZYËÚÈHÛÛ\ÜÙK^XÝ[\\[Ê\NÈÚÈÂBBB\]\\Ë\BB_BBBZY\ÜË\Ê\\ÝX[PØ[Ù[Y
+HÂBBB\]\\Ë\BB_BB_BB\]PÝH	\Y]PÛÛ^ÓW^ÂBBT]P][\][\
+ÈKBBR[]Y\ÜØYÙ\ÎÝ\[[]BBSÜ[ÛÎÝ\[ÜËBBSÝ]]Y\ÜØYÙNÝ]BBQ\\B_BBYXÚ\Ú[ÛHÛÛYËÚÝ[]JÝ]PÝ
+BBZYXÚ\Ú[ÛOH[ÂBBYXÚ\Ú[ÛH	\Y]QXÚ\Ú[ÛÓW^ßBB_BBZYYXÚ\Ú[Û]HÂBBZYXÚ\Ú[Û]Ü]Q\ÜOH[ÂBBB\]\\ËXÚ\Ú[Û]Ü]Q\ÜBB_BBBZY\OH[ÂBBB\]\\Ë\BB_BBBZY^XÐÝOH[	^XÐÝÙ[\]ÜOH[	Ý]OH[ÂBBBY][H\Y[Ù[Ý]]][
+Ý][
+BBBBY^XÐÝÙ[
+][
+BBB_BBB\]\Ý][B_BB[\Ý\H\BZY\Ý\OH[ÂBB[\Ý\H]\Ü[Ù[Ý]]ZXÝYHÚÝ[]H]][\	Y][\
+ÌJBB_BBZY][\HÛÛYËX^]Y\ÈÂBBXXZÂB_BBX\QXÚ\Ú[ÛÜ]J	Ý\[[]	Ý\[ÜËÝXÚ\Ú[ÛBBY[^HHXÚ\Ú[ÛXÚÛÙBZY[^HOHÂBBY[^HHXÚÛÙ[ÊÝ][\
+ÌJBB_BBZY\HÛÛ^]Ø\TÛY\
+Ý[^JNÈ\OH[ÂBB\]\\Ë\B_B_B\]\\Ë	]Q^]\ÝY\ÜÓ\Ý\\Ý\Ý[]Y\ÎÛÛYËX^]Y\ßBB[È
+
+\Y]S[Ù[Ü\\ÓWJHÛÛ^]Ø\TÛY\
+ÝÛÛ^ÛÛ^[^H[YK\][ÛH\ÜÂZY[^HHÂB\]\[_B\Ù[XÝÂXØ\ÙHXÝÛJ
+NB\]\Ý\
+BXØ\ÙH][YKY\[^JNB\]\[_BB[ÈÝX[UÚ]ÚÝ[]VÓHY\ÜØYÙU\WJ
+\Y]S[Ù[Ü\\ÓWKÝÛÛ^ÛÛ^[]×SKÜÈ[Ù[Ü[ÛH
+JØÚ[XKÝX[TXY\ÓWK\ÜHÂXXÚÛÙ[ÈHÛÛYËXÚÛÙ[ÂZYXÚÛÙ[ÈOH[ÂBXXÚÛÙ[ÈHY][XÚÛÙ_BYY\[Ê
+HÂBWÈHÛÛ\ÜÙKØÙ\ÜÔÝ]JÝ[ÊÈÛÛ^ÛÛ^Ý
+\YÝ]VÓWJH\ÜÂBB\ÝÙ]]P][\
+
+BBB\]\[B_JB_J
+BY^XÐÝHÙ]\YÚ][Ù[YÙ[^XÐÝÓWJÝ
+BXÝ\[[]H[]XÝ\[ÜÈHÜÂ]\\Ý\\Ü]\Ý\ÚYÛ[
+]U\XÝÚYÛ[KËÈ[XÈXÛÝ\HÜ\XÝÚYÛ[YÚÝ[]H[XÜËHÛSÑÙ\Ü\\ÛÜÝ\\È[KËÈZ[ÝX[PÛÛ\Ü[ÛÈÚ[ØÚÈÜ]\ÛÚYÛ[ÚØ]\Ú[ÈHÛÜÝ][HXZË\ÂKËÈY\[Ý\\ÈH\XÝ\È[Ø^\ÈÙ[][Û[XËYÜHK\[XÚÚ[ËYY\[Ê
+HÂBZYHXÛÝ\
+NÈOH[ÂBBZYÝ\ÚYÛ[OH[ÂBBB\Ù[XÝÂBBBXØ\ÙHÝ\ÚYÛ[ÚH]U\XÝÕÚ[]N[ÙK\]\Ü[XÎ	]
+_NBBBYY][BBB_BBB_BBB\[XÊ
+BB_B_J
+BYÜ][\HÈ][\HÛÛYËX^]Y\ÎÈ][\
+ÊÈÂBWÈHÛÛ\ÜÙKØÙ\ÜÔÝ]JÝ[ÊÈÛÛ^ÛÛ^Ý
+\YÝ]VÓWJH\ÜÂBB\ÝÙ]]P][\
+][\
+BBB\]\[B_JBB\ÚYÛ[H	]U\XÝÚYÛ[ØÚXZÙJÚ[]U\XÝJ_BBXÝ\ÚYÛ[HÚYÛ[BZY^XÐÝOH[ÂBBY^XÐÝ]U\XÝÚYÛ[HÚYÛ[B_BB\ÝX[K\H[\ÝX[JÝÝ\[[]Ý\[ÜËBBZY\OH[ÂBBKËÈY[Ú]HË[ÜÚ[ÝX[J
+H]\È[\ÜÈÝX[H^\ÝËÛÂBBKËÈ][Ù[\[Ù[]\ÜX]\ÈHÝX[TXY\Ú]ÛÛ\ÛÚÜÈ]ÛÝ[BBKËÈXYÛHÚYÛ[Ú\ÈÙ[\ÈÈÛÛÝ[Y\8 %]Y\[H[ÈBBBKËÈY\Y
+JHÛÝÛÈH[XË\XÛÝ\HY\
+Ù[XÝÙY][
+HÛÛÝØÚÂBBKËÈYH]\[XÈY\ÈÈÙ[HÙXÛÛ\XÝHÚYÛ[\È\ØØ\YBBKËÈÚ[H^]\][ÛÜX]\ÈH]ÈÛKBB\ÚYÛ[ÚH]U\XÝÕÚ[]N[Ù_BBBZYËÚÈHÛÛ\ÜÙK^XÝ[\\[Ê\NÈÚÈÂBBB\]\[\BB_BBBZY\ÜË\Ê\\ÝX[PØ[Ù[Y
+HÂBBB\]\[\BB_BBB\]PÝH	\Y]PÛÛ^ÓW^ÂBBBT]P][\][\
+ÈKBBBR[]Y\ÜØYÙ\ÎÝ\[[]BBBSÜ[ÛÎÝ\[ÜËBBBQ\\BB_BBBYXÚ\Ú[ÛHÛÛYËÚÝ[]JÝ]PÝ
+BBBZYXÚ\Ú[ÛOH[ÂBBBYXÚ\Ú[ÛH	\Y]QXÚ\Ú[ÛÓW^ßBBB_BBBZYYXÚ\Ú[Û]HÂBBBZYXÚ\Ú[Û]Ü]Q\ÜOH[ÂBBBB\]\[XÚ\Ú[Û]Ü]Q\ÜBBB_BBBB\]\[\BB_BBB[\Ý\H\BBZY][\ÛÛYËX^]Y\ÈÂBBBX\QXÚ\Ú[ÛÜ]J	Ý\[[]	Ý\[ÜËÝXÚ\Ú[ÛBBBBY[^HHXÚ\Ú[ÛXÚÛÙBBBZY[^HOHÂBBBBY[^HHXÚÛÙ[ÊÝ][\
+ÌJBBBB_BBBBZY\HÛÛ^]Ø\TÛY\
+Ý[^JNÈ\OH[ÂBBBB\]\[\BBB_BBB_BBBXÛÛ[YBB_BBKËÈÜ]HÝX[NÚXÚÐÛÜH\ÈÛÛÝ[YYÞ[ÚÛÝ\ÛH\HÈZ[HÛÛ\]BBKËÈY\ÜØYÙHÜÚÝ[]H[ÜXÝ[ÛÈ]\ÛÜH\È]\YÈHØ[\[X^BBKËÈ[XYHHÛÛÝ[YYÝÛÝX[H[\[[H\XÝÚYÛ[YÙ\ÈHÛÎBKËÈÛÙHÚÝ[]HXÚY\ËHÚYÛ[[È]\ÛÜIÜÈ\Ü\\ÛÛSÑÚ]\BKËÈÈ\ÜÈÝYÚÜX[HÜ[XÝHÚ[]Q\ÜBXÛÜY\ÈHÝX[KÛÜJBBXÚXÚÐÛÜHHÛÜY\ÖÌBB\]\ÛÜHHÛÜY\ÖÌWBB[\ÙËÝX[Q\H\YÛÛÝ[YTÝX[JÚXÚÐÛÜJBBKËÈHZY\ÝX[HÜ\[\\[Û]\ÝÝÜH]HÞXÛH[ÙY\]ÂBKËÈÜYÚ[[\ÜX]Ú[ÈHZ][ÜÙH\XÝÝX[J
+H\ÜBZYËÚÈHÛÛ\ÜÙK^XÝ[\\[ÊÝX[Q\NÈÚÈÂBB\ÚYÛ[ÚH]U\XÝÕÚ[]N[Ù_BBB\]\ÛÜKÛÜÙJ
+BBB\]\[ÝX[Q\B_BBZY\ÜË\ÊÝX[Q\\ÝX[PØ[Ù[Y
+HÂBB\ÚYÛ[ÚH]U\XÝÕÚ[]N[Ù_BBB\]\ÛÜKÛÜÙJ
+BBB\]\[ÝX[Q\B_BB\]PÝH	\Y]PÛÛ^ÓW^ÂBBT]P][\][\
+ÈKBBR[]Y\ÜØYÙ\ÎÝ\[[]BBSÜ[ÛÎÝ\[ÜËBBSÝ]]Y\ÜØYÙN\ÙËBBQ\ÝX[Q\B_BBYXÚ\Ú[ÛHÛÛYËÚÝ[]JÝ]PÝ
+BBZYXÚ\Ú[ÛOH[ÂBBYXÚ\Ú[ÛH	\Y]QXÚ\Ú[ÛÓW^ßBB_BBZYYXÚ\Ú[Û]HÂBB\ÚYÛ[ÚH]U\XÝÕÚ[]N[Ù_BBBZYXÚ\Ú[Û]Ü]Q\ÜOH[ÂBBB\]\ÛÜKÛÜÙJ
+BBBB\]\[XÚ\Ú[Û]Ü]Q\ÜBB_BBBZYÝX[Q\OH[ÂBBB\]\ÛÜKÛÜÙJ
+BBBB\]\[ÝX[Q\BB_BBB\]\]\ÛÜK[B_BB]\XÝ\HÝX[Q\BZY\XÝ\OH[ÂBB]\XÝ\H]\Ü[Ù[Ý]]ZXÝYHÚÝ[]H]][\	Y][\
+ÌJBB_BB\ÚYÛ[ÚH]U\XÝÂBBUÚ[]NYKBBT]P][\][\BBQ\\XÝ\BBTZXÝX\ÛÛXÚ\Ú[ÛZXÝX\ÛÛB_BB\]\ÛÜKÛÜÙJ
+BB[\Ý\H\XÝ\BZY][\ÛÛYËX^]Y\ÈÂBBX\QXÚ\Ú[ÛÜ]J	Ý\[[]	Ý\[ÜËÝXÚ\Ú[ÛBBBY[^HHXÚ\Ú[ÛXÚÛÙBBZY[^HOHÂBBBY[^HHXÚÛÙ[ÊÝ][\
+ÌJBBB_BBBZY\HÛÛ^]Ø\TÛY\
+Ý[^JNÈ\OH[ÂBBB\]\[\BB_BB_B_B\]\[	]Q^]\ÝY\ÜÓ\Ý\\Ý\Ý[]Y\ÎÛÛYËX^]Y\ßBB[È\QXÚ\Ú[ÛÜ]VÓHY\ÜØYÙU\WJÝ\[[]
+×SKÝ\[ÜÈ
+×[[Ù[Ü[ÛÝÛÛ^ÛÛ^XÚ\Ú[Û
+\Y]QXÚ\Ú[ÛÓWJHÂZYXÚ\Ú[Û[ÙYYY[]Y\ÜØYÙ\ÈOH[ÂBJÝ\[[]HXÚ\Ú[Û[ÙYYY[]Y\ÜØYÙ\ÂBZYXÚ\Ú[Û\Ú\Ý[ÙYYY[]Y\ÜØYÙ\ÈÂBB[[ÙYYY[]H
+Ý\[[]BBWÈHÛÛ\ÜÙKØÙ\ÜÔÝ]JÝ[ÊÈÛÛ^ÛÛ^Ý
+\YÝ]VÓWJH\ÜÂBBB\ÝY\ÜØYÙ\ÈH[ÙYYY[]BBB\]\[BB_JBB_B_BZYXÚ\Ú[ÛY][Û[Ü[ÛÈOH[ÂBXÛÛYHXZÙJ×[[Ù[Ü[Û[
+Ý\[ÜÊK[
+Ý\[ÜÊJÛ[XÚ\Ú[ÛY][Û[Ü[ÛÊJBBXÛÜJÛÛY
+Ý\[ÜÊBBJÝ\[ÜÈH\[
+ÛÛYXÚ\Ú[ÛY][Û[Ü[ÛËB_BB[È
+
+\Y]S[Ù[Ü\\ÓWJHÝX[JÝÛÛ^ÛÛ^[]×SKÜÈ[Ù[Ü[ÛH
+JØÚ[XKÝX[TXY\ÓWK\ÜHÂZYÛÛYËÚÝ[]HOH[ÂB\]\ÝX[UÚ]ÚÝ[]JÝ[]ÜËB_B\]\ÝX[SYØXÞJÝ[]ÜËBB[È
+
+\Y]S[Ù[Ü\\ÓWJHÝX[SYØXÞJÝÛÛ^ÛÛ^[]×SKÜÈ[Ù[Ü[ÛH
+JØÚ[XKÝX[TXY\ÓWK\ÜHÂZ\Ô]PXHHÛÛYË\Ô]PXBZY\Ô]PXHOH[ÂBZ\Ô]PXHHY][\Ô]PXB_BXXÚÛÙ[ÈHÛÛYËXÚÛÙ[ÂZYXÚÛÙ[ÈOH[ÂBXXÚÛÙ[ÈHY][XÚÛÙ_BYY\[Ê
+HÂBWÈHÛÛ\ÜÙKØÙ\ÜÔÝ]JÝ[ÊÈÛÛ^ÛÛ^Ý
+\YÝ]VÓWJH\ÜÂBB\ÝÙ]]P][\
+
+BBB\]\[B_JB_J
+B]\\Ý\\ÜYÜ][\HÈ][\HÛÛYËX^]Y\ÎÈ][\
+ÊÈÂBWÈHÛÛ\ÜÙKØÙ\ÜÔÝ]JÝ[ÊÈÛÛ^ÛÛ^Ý
+\YÝ]VÓWJH\ÜÂBB\ÝÙ]]P][\
+][\
+BBB\]\[B_JBB\ÝX[K\H[\ÝX[JÝ[]ÜËBBZY\OH[ÂBBZYËÚÈHÛÛ\ÜÙK^XÝ[\\[Ê\NÈÚÈÂBBB\]\[\BB_BBBZY\ÜË\Ê\\ÝX[PØ[Ù[Y
+HÂBBB\]\[\BB_BBBZYZ\Ô]PXJÝ\HÂBBB\]\[\BB_BBB[\Ý\H\BBZY][\ÛÛYËX^]Y\ÈÂBBBZY\HÛÛ^]Ø\TÛY\
+ÝXÚÛÙ[ÊÝ][\
+ÌJJNÈ\OH[ÂBBBB\]\[\BBB_BBB_BBBXÛÛ[YBB_BBXÛÜY\ÈHÝX[KÛÜJBBXÚXÚÐÛÜHHÛÜY\ÖÌBB\]\ÛÜHHÛÜY\ÖÌWBB\ÝX[Q\HÛÛÝ[YTÝX[QÜ\ÜÚXÚÐÛÜJBBZYÝX[Q\OH[ÂBB\]\]\ÛÜK[B_BB\]\ÛÜKÛÜÙJ
+BBKËÈHZY\ÝX[HÜ\[\\[Û]\ÝÝÜH]HÞXÛH[ÙY\]ÂBKËÈÜYÚ[[\ÜX]Ú[ÈHZ][ÜÙH\XÝÝX[J
+H\ÜBZYËÚÈHÛÛ\ÜÙK^XÝ[\\[ÊÝX[Q\NÈÚÈÂBB\]\[ÝX[Q\B_BBZY\ÜË\ÊÝX[Q\\ÝX[PØ[Ù[Y
+HÂBB\]\[ÝX[Q\B_BBZYZ\Ô]PXJÝÝX[Q\HÂBB\]\[ÝX[Q\B_BB[\Ý\HÝX[Q\BZY][\ÛÛYËX^]Y\ÈÂBBZY\HÛÛ^]Ø\TÛY\
+ÝXÚÛÙ[ÊÝ][\
+ÌJJNÈ\OH[ÂBBB\]\[\BB_BB_B_B\]\[	]Q^]\ÝY\ÜÓ\Ý\\Ý\Ý[]Y\ÎÛÛYËX^]Y\ßBB
