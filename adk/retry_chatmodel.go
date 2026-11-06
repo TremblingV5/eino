@@ -474,6 +474,14 @@ func generateWithShouldRetry[M MessageType](r *typedRetryModelWrapper[M], ctx co
 }
 
 func (r *typedRetryModelWrapper[M]) contextAwareSleep(ctx context.Context, delay time.Duration) error {
+	// Check cancellation before the zero/negative delay shortcut: once the caller context
+	// is cancelled at the backoff boundary, return its cancellation error instead of
+	// proceeding with more model calls, even when the retry has no delay.
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
 	if delay <= 0 {
 		return nil
 	}
