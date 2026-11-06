@@ -19,6 +19,7 @@ package adk
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync/atomic"
@@ -3205,4 +3206,156 @@ func TestWillRetryError_RejectReason(t *testing.T) {
 		assert.Equal(t, "rejected", wrErr.Error())
 		assert.Equal(t, 2, wrErr.RetryAttempt)
 	})
+}
+
+// Regression tests for https://github.com/cloudwego/eino/issues/1448:
+// zero/negative backoff must not bypass caller cancellation.
+
+func TestContextAwareSleep_CancelledContext(t *testing.T) {
+	w := &typedRetryModelWrapper[*schema.Message]{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// A cancelled caller must get the context error for any delay,
+	// including zero and negative backoff.
+	for _, delay := range []time.Duration{0, -time.Nanosecond, time.Hour} {
+		assert.ErrorIs(t, w.contextAwareSleep(ctx, delay), context.Canceled,
+			"cancelled context with delay %v should return context.Canceled", delay)
+	}
+
+	// An active context still allows immediate retries on zero/negative backoff.
+	assert.NoError(t, w.contextAwareSleep(context.Background(), 0))
+	assert.NoError(t, w.contextAwareSleep(context.Background(), -time.Nanosecond))
+
+	// An active context waits for a positive delay.
+	start := time.Now()
+	assert.NoError(t, w.contextAwareSleep(context.Background(), 5*time.Millisecond))
+	assert.GreaterOrEqual(t, time.Since(start), 5*time.Millisecond)
+}
+
+// retryCancellationPolicies builds the legacy and ShouldRetry policy variants,
+// both cancelling the caller context inside BackoffFunc before the next retry.
+func retryCancellationPolicies(cancel context.CancelFunc, backoff time.Duration) map[string]*ModelRetryConfig {
+	backoffFunc := func(context.Context, int) time.Duration {
+		cancel()
+		return backoff
+	}
+	return map[string]*ModelRetryConfig{
+		"legacy": {
+			MaxRetries:  5,
+			IsRetryAble: func(context.Context, error) bool { return true },
+			BackoffFunc: backoffFunc,
+		},
+		"should-retry": {
+			MaxRetries:  5,
+			ShouldRetry: func(context.Context, *RetryContext) *RetryDecision { return &RetryDecision{Retry: true} },
+			BackoffFunc: backoffFunc,
+		},
+	}
+}
+
+func TestRetryZeroBackoffRespectsCancellation_Generate(t *testing.T) {
+	for _, policy := range []string{"legacy", "should-retry"} {
+		for _, backoff := range []time.Duration{0, -time.Nanosecond, time.Hour} {
+			t.Run(fmt.Sprintf("%s/backoff_%v", policy, backoff), func(t *testing.T) {
+				ctrl := gomock.NewController(t)
+				defer ctrl.Finish()
+
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+
+				cm := mockModel.NewMockToolCallingChatModel(ctrl)
+				var calls int32
+				cm.EXPECT().Generate(gomock.Any(), gomock.Any(), gomock.Any()).
+					DoAndReturn(func(context.Context, []*schema.Message, ...model.Option) (*schema.Message, error) {
+						atomic.AddInt32(&calls, 1)
+						return nil, errRetryAble
+					}).AnyTimes()
+
+				w := newTypedRetryModelWrapper[*schema.Message](cm, retryCancellationPolicies(cancel, backoff)[policy])
+				_, err := w.Generate(ctx, []*schema.Message{schema.UserMessage("hi")})
+
+				require.ErrorIs(t, err, context.Canceled,
+					"cancelled at the backoff boundary should surface context.Canceled")
+				assert.NotErrorIs(t, err, ErrExceedMaxRetries)
+				assert.Equal(t, int32(1), atomic.LoadInt32(&calls),
+					"no further model call may be dispatched after cancellation")
+			})
+		}
+	}
+}
+
+func TestRetryZeroBackoffRespectsCancellation_StreamStartupError(t *testing.T) {
+	for _, policy := range []string{"legacy", "should-retry"} {
+		for _, backoff := range []time.Duration{0, -time.Nanosecond, time.Hour} {
+			t.Run(fmt.Sprintf("%s/backoff_%v", policy, backoff), func(t *testing.T) {
+				ctrl := gomock.NewController(t)
+				defer ctrl.Finish()
+
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+
+				cm := mockModel.NewMockToolCallingChatModel(ctrl)
+				var calls int32
+				cm.EXPECT().Stream(gomock.Any(), gomock.Any(), gomock.Any()).
+					DoAndReturn(func(context.Context, []*schema.Message, ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+						atomic.AddInt32(&calls, 1)
+						return nil, errRetryAble
+					}).AnyTimes()
+
+				w := newTypedRetryModelWrapper[*schema.Message](cm, retryCancellationPolicies(cancel, backoff)[policy])
+				sr, err := w.Stream(ctx, []*schema.Message{schema.UserMessage("hi")})
+				if sr != nil {
+					sr.Close()
+				}
+
+				require.ErrorIs(t, err, context.Canceled,
+					"cancelled at the backoff boundary should surface context.Canceled")
+				assert.NotErrorIs(t, err, ErrExceedMaxRetries)
+				assert.Equal(t, int32(1), atomic.LoadInt32(&calls),
+					"no further model call may be dispatched after cancellation")
+			})
+		}
+	}
+}
+
+func TestRetryZeroBackoffRespectsCancellation_StreamMidError(t *testing.T) {
+	for _, policy := range []string{"legacy", "should-retry"} {
+		for _, backoff := range []time.Duration{0, -time.Nanosecond, time.Hour} {
+			t.Run(fmt.Sprintf("%s/backoff_%v", policy, backoff), func(t *testing.T) {
+				ctrl := gomock.NewController(t)
+				defer ctrl.Finish()
+
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+
+				cm := mockModel.NewMockToolCallingChatModel(ctrl)
+				var calls int32
+				cm.EXPECT().Stream(gomock.Any(), gomock.Any(), gomock.Any()).
+					DoAndReturn(func(context.Context, []*schema.Message, ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+						atomic.AddInt32(&calls, 1)
+						sr, sw := schema.Pipe[*schema.Message](2)
+						go func() {
+							defer sw.Close()
+							sw.Send(schema.AssistantMessage("partial", nil), nil)
+							sw.Send(nil, errRetryAble)
+						}()
+						return sr, nil
+					}).AnyTimes()
+
+				w := newTypedRetryModelWrapper[*schema.Message](cm, retryCancellationPolicies(cancel, backoff)[policy])
+				sr, err := w.Stream(ctx, []*schema.Message{schema.UserMessage("hi")})
+				if sr != nil {
+					sr.Close()
+				}
+
+				require.ErrorIs(t, err, context.Canceled,
+					"cancelled at the backoff boundary should surface context.Canceled")
+				assert.NotErrorIs(t, err, ErrExceedMaxRetries)
+				assert.Equal(t, int32(1), atomic.LoadInt32(&calls),
+					"no further model call may be dispatched after cancellation")
+			})
+		}
+	}
 }
