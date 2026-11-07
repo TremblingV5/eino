@@ -427,17 +427,25 @@ type toolsTuple struct {
 	enhancedInvokableEndpoints  []EnhancedInvokableToolEndpoint
 	enhancedStreamableEndpoints []EnhancedStreamableToolEndpoint
 	// argsAliasMap stores reverse argument alias mappings for each tool.
-	// key: canonical tool name, value: map[aliasKey]canonicalKey (alias → canonical direction)
-	argsAliasMap map[string]map[string]string
+	// key: canonical tool name, value: ordered alias entries (alias → canonical direction).
+	// The order follows the configured canonical arguments (sorted) and the configured
+	// alias order within each canonical argument, so alias resolution is deterministic.
+	argsAliasMap map[string][]argsAliasEntry
 	// canonicalNames stores the canonical name for each tool index
 	canonicalNames []string
 	// toolInfos stores the ToolInfo for each tool index, used for alias validation
 	toolInfos []*schema.ToolInfo
 }
 
+// argsAliasEntry maps a single configured argument alias to its canonical key.
+type argsAliasEntry struct {
+	alias     string
+	canonical string
+}
+
 // remapArgs replaces alias keys in the JSON arguments string with canonical keys.
-// aliasMap: alias → canonical mapping
-func remapArgs(args string, aliasMap map[string]string) (string, error) {
+// aliasMap: ordered alias → canonical mappings
+func remapArgs(args string, aliasMap []argsAliasEntry) (string, error) {
 	if len(aliasMap) == 0 {
 		return args, nil
 	}
@@ -453,14 +461,16 @@ func remapArgs(args string, aliasMap map[string]string) (string, error) {
 	}
 
 	changed := false
-	for alias, canonical := range aliasMap {
-		if v, ok := m[alias]; ok {
+	for _, entry := range aliasMap {
+		if v, ok := m[entry.alias]; ok {
+			// Apply aliases in configured order, so the first configured alias wins when
+			// several aliases are supplied without the canonical key.
 			// Only replace if canonical key doesn't exist.
 			// If both alias and canonical are present (e.g. {"q":"a","query":"b"}),
 			// the alias key is kept as-is and passed through as an unknown field.
-			if _, exists := m[canonical]; !exists {
-				m[canonical] = v
-				delete(m, alias)
+			if _, exists := m[entry.canonical]; !exists {
+				m[entry.canonical] = v
+				delete(m, entry.alias)
 				changed = true
 			}
 		}
@@ -486,7 +496,7 @@ type convToolsParams struct {
 }
 
 func (t *toolsTuple) applyAliasConfigs(aliasConfigs map[string]ToolAliasConfig) error {
-	t.argsAliasMap = make(map[string]map[string]string)
+	t.argsAliasMap = make(map[string][]argsAliasEntry)
 
 	sortedToolNames := make([]string, 0, len(aliasConfigs))
 	for toolName := range aliasConfigs {
@@ -557,6 +567,7 @@ func (t *toolsTuple) applyArgsAliases(toolName string, toolIdx int, argumentsAli
 	}
 
 	reverseMap := make(map[string]string)
+	entries := make([]argsAliasEntry, 0)
 	sortedCanonicals := make([]string, 0, len(argumentsAliases))
 	for canonical := range argumentsAliases {
 		sortedCanonicals = append(sortedCanonicals, canonical)
@@ -585,9 +596,10 @@ func (t *toolsTuple) applyArgsAliases(toolName string, toolIdx int, argumentsAli
 					toolName, alias, existingCanonical, canonical)
 			}
 			reverseMap[alias] = canonical
+			entries = append(entries, argsAliasEntry{alias: alias, canonical: canonical})
 		}
 	}
-	t.argsAliasMap[toolName] = reverseMap
+	t.argsAliasMap[toolName] = entries
 
 	return nil
 }

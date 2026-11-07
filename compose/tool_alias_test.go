@@ -408,7 +408,7 @@ func TestToolAliasesE2E(t *testing.T) {
 }
 
 func TestRemapArgsEdgeCases(t *testing.T) {
-	aliasMap := map[string]string{"q": "query"}
+	aliasMap := []argsAliasEntry{{alias: "q", canonical: "query"}}
 
 	t.Run("empty string", func(t *testing.T) {
 		result, err := remapArgs("", aliasMap)
@@ -459,6 +459,81 @@ func TestRemapArgsEdgeCases(t *testing.T) {
 		assert.NotContains(t, m, "q")
 		assert.Equal(t, float64(42), m["unknown_field"])
 	})
+}
+
+func TestRemapArgsMultipleAliasesUseConfiguredOrder(t *testing.T) {
+	aliasMap := []argsAliasEntry{
+		{alias: "q", canonical: "query"},
+		{alias: "search_term", canonical: "query"},
+	}
+
+	// Repeated runs must always resolve to the first configured alias instead of
+	// depending on Go map iteration order.
+	for i := 0; i < 100; i++ {
+		result, err := remapArgs(`{"q":"first","search_term":"second"}`, aliasMap)
+		require.NoError(t, err)
+
+		var m map[string]any
+		require.NoError(t, json.Unmarshal([]byte(result), &m))
+		assert.Equal(t, "first", m["query"])
+		// The unselected alias keeps its pass-through behavior.
+		assert.Equal(t, "second", m["search_term"])
+		assert.NotContains(t, m, "q")
+	}
+
+	// An explicitly supplied canonical key still has the highest priority.
+	result, err := remapArgs(`{"q":"first","search_term":"second","query":"explicit"}`, aliasMap)
+	require.NoError(t, err)
+
+	var m map[string]any
+	require.NoError(t, json.Unmarshal([]byte(result), &m))
+	assert.Equal(t, "explicit", m["query"])
+	assert.Equal(t, "first", m["q"])
+	assert.Equal(t, "second", m["search_term"])
+}
+
+func TestToolsNodeMultipleAliasesUseConfiguredOrder(t *testing.T) {
+	ctx := context.Background()
+
+	receivedArgs := ""
+	searchTool := newTool(&schema.ToolInfo{
+		Name: "search",
+		Desc: "Search for information",
+		ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+			"query": {Type: "string"},
+		}),
+	}, func(ctx context.Context, args *searchArgs) (string, error) {
+		receivedArgs = args.Query
+		return "result", nil
+	})
+
+	node, err := NewToolNode(ctx, &ToolsNodeConfig{
+		Tools: []tool.BaseTool{searchTool},
+		ToolAliases: map[string]ToolAliasConfig{
+			"search": {
+				ArgumentsAliases: map[string][]string{
+					"query": {"q", "search_term"},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	input := schema.AssistantMessage("", []schema.ToolCall{
+		{
+			ID: "call_1",
+			Function: schema.FunctionCall{
+				Name:      "search",
+				Arguments: `{"q":"first","search_term":"second"}`,
+			},
+		},
+	})
+
+	for i := 0; i < 100; i++ {
+		_, err = node.Invoke(ctx, input)
+		require.NoError(t, err)
+		assert.Equal(t, "first", receivedArgs)
+	}
 }
 
 func TestCanonicalNameCallWithAliasConfigured(t *testing.T) {
