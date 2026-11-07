@@ -174,7 +174,12 @@ func (o Option) DesignateNode(nodeKey ...string) Option {
 // nodePath := NewNodePath("sub_graph_node_key", "node_key_within_sub_graph")
 // DesignateNodeWithPath(nodePath)
 func (o Option) DesignateNodeWithPath(path ...*NodePath) Option {
-	o.paths = append(o.paths, path...)
+	// Copy the existing paths into a fresh slice before appending. Appending to o.paths
+	// directly can reuse the receiver's spare capacity, which is shared with other
+	// options derived from the same base and would silently overwrite their targets.
+	nPaths := make([]*NodePath, len(o.paths), len(o.paths)+len(path))
+	copy(nPaths, o.paths)
+	o.paths = append(nPaths, path...)
 	return o
 }
 

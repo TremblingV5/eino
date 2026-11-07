@@ -86,6 +86,55 @@ func (t *testModel) Stream(ctx context.Context, input []*schema.Message, opts ..
 	return sr, nil
 }
 
+func TestDerivedNodeOptionsKeepIndependentTargets(t *testing.T) {
+	ctx := context.Background()
+
+	newNode := func(name string) *Lambda {
+		return InvokableLambdaWithOption(func(ctx context.Context, input string, opts ...bool) (string, error) {
+			if len(opts) > 0 && opts[0] {
+				return input + name + ";", nil
+			}
+			return input, nil
+		})
+	}
+
+	g := NewGraph[string, string]()
+	for _, key := range []string{"common1", "common2", "common3", "left", "right"} {
+		assert.NoError(t, g.AddLambdaNode(key, newNode(key)))
+	}
+	assert.NoError(t, g.AddEdge(START, "common1"))
+	assert.NoError(t, g.AddEdge("common1", "common2"))
+	assert.NoError(t, g.AddEdge("common2", "common3"))
+	assert.NoError(t, g.AddEdge("common3", "left"))
+	assert.NoError(t, g.AddEdge("left", "right"))
+	assert.NoError(t, g.AddEdge("right", END))
+
+	r, err := g.Compile(ctx)
+	assert.NoError(t, err)
+
+	base := WithLambdaOption(true).
+		DesignateNode("common1").
+		DesignateNode("common2").
+		DesignateNode("common3")
+
+	left := base.DesignateNode("left")
+	right := base.DesignateNode("right")
+
+	assert.Len(t, base.paths, 3)
+	assert.Len(t, left.paths, 4)
+	assert.Len(t, right.paths, 4)
+	assert.Equal(t, []string{"left"}, left.paths[3].GetPath())
+	assert.Equal(t, []string{"right"}, right.paths[3].GetPath())
+
+	out, err := r.Invoke(ctx, "", left)
+	assert.NoError(t, err)
+	assert.Equal(t, "common1;common2;common3;left;", out)
+
+	out, err = r.Invoke(ctx, "", right)
+	assert.NoError(t, err)
+	assert.Equal(t, "common1;common2;common3;right;", out)
+}
+
 func TestCallOption(t *testing.T) {
 	g := NewGraph[[]*schema.Message, *schema.Message]()
 	err := g.AddLambdaNode("1", InvokableLambdaWithOption(func(ctx context.Context, input []*schema.Message, opts ...string) (output []*schema.Message, err error) {
