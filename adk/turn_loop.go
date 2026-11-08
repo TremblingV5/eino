@@ -992,8 +992,6 @@ func (l *TurnLoop[T, M]) tryLoadCheckpoint(ctx context.Context) error {
 		return nil
 	}
 
-	l.loadCheckpointID = checkPointID
-
 	data, existed, err := l.config.Store.Get(ctx, checkPointID)
 	if err != nil {
 		return fmt.Errorf("failed to load checkpoint[%s]: %w", checkPointID, err)
@@ -1010,6 +1008,11 @@ func (l *TurnLoop[T, M]) tryLoadCheckpoint(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal checkpoint[%s]: %w", checkPointID, err)
 	}
+
+	// Mark the checkpoint as loaded only after it has been read and decoded
+	// successfully. Recording the ID earlier would let cleanup delete a saved
+	// checkpoint when a transient read error prevented its restoration.
+	l.loadCheckpointID = checkPointID
 
 	newItems := l.buffer.TakeAll()
 
