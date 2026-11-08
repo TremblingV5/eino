@@ -1815,6 +1815,13 @@ func (l *TurnLoop[T, M]) runAgentAndHandleEvents(
 	l.capturedCancelErr = nil
 	l.checkPointRunnerBytes = nil
 
+	// turnCtx is owned by this turn and cancelled when the turn exits, so that
+	// cooperative agent work cannot outlive the loop (e.g. when the event
+	// callback fails without draining the event iterator). The parent loop
+	// context stays live for later cleanup/checkpoint operations.
+	turnCtx, cancelTurn := context.WithCancel(ctx)
+	defer cancelTurn()
+
 	var iter *AsyncIterator[*TypedAgentEvent[M]]
 
 	runOpts, ms, err := l.setupBridgeStore(spec, spec.runOpts)
@@ -1849,7 +1856,7 @@ func (l *TurnLoop[T, M]) runAgentAndHandleEvents(
 		Stopped:   stoppedDone,
 		StopCause: l.stopCtrl.cause,
 	}
-	l.preemptCtrl.beginActiveTurn(ctx, tc)
+	l.preemptCtrl.beginActiveTurn(turnCtx, tc)
 	l.stopCtrl.beginActiveTurn()
 	defer func() {
 		l.stopCtrl.endActiveTurn()
@@ -1859,15 +1866,15 @@ func (l *TurnLoop[T, M]) runAgentAndHandleEvents(
 	if spec.isResume {
 		var err error
 		if spec.resumeParams != nil {
-			iter, err = runner.ResumeWithParams(ctx, bridgeCheckpointID, spec.resumeParams, runOpts...)
+			iter, err = runner.ResumeWithParams(turnCtx, bridgeCheckpointID, spec.resumeParams, runOpts...)
 		} else {
-			iter, err = runner.Resume(ctx, bridgeCheckpointID, runOpts...)
+			iter, err = runner.Resume(turnCtx, bridgeCheckpointID, runOpts...)
 		}
 		if err != nil {
 			return fmt.Errorf("failed to resume agent: %w", err)
 		}
 	} else {
-		iter = runner.Run(ctx, spec.input.Messages, runOpts...)
+		iter = runner.Run(turnCtx, spec.input.Messages, runOpts...)
 	}
 
 	// Wrap iterator to capture framework-level signals (CancelError, InterruptContexts)
@@ -1899,7 +1906,7 @@ func (l *TurnLoop[T, M]) runAgentAndHandleEvents(
 	iter = proxyIter
 
 	handleEvents := func() error {
-		return l.onAgentEvents(ctx, tc, iter)
+		return l.onAgentEvents(turnCtx, tc, iter)
 	}
 
 	done := make(chan struct{})
