@@ -213,22 +213,38 @@ func (at *typedAgentTool[M]) InvokableRun(ctx context.Context, argumentsInJSON s
 		}
 	}
 
-	var lastEvent *TypedAgentEvent[M]
+	var (
+		lastEvent *TypedAgentEvent[M]
+		// finalMessageEvent retains the last event carrying a message output. It is tracked
+		// separately from lastEvent because control-only events (e.g. custom actions emitted
+		// by AfterAgent handlers) must not replace or close the agent's final answer.
+		finalMessageEvent *TypedAgentEvent[M]
+	)
+
+	closeRetainedStream := func() {
+		if finalMessageEvent == nil ||
+			finalMessageEvent.Output == nil ||
+			finalMessageEvent.Output.MessageOutput == nil ||
+			finalMessageEvent.Output.MessageOutput.MessageStream == nil {
+			return
+		}
+		finalMessageEvent.Output.MessageOutput.MessageStream.Close()
+	}
+
 	for {
 		event, ok := iter.Next()
 		if !ok {
 			break
 		}
 
-		if lastEvent != nil &&
-			lastEvent.Output != nil &&
-			lastEvent.Output.MessageOutput != nil &&
-			lastEvent.Output.MessageOutput.MessageStream != nil {
-			lastEvent.Output.MessageOutput.MessageStream.Close()
+		if event.Err != nil {
+			closeRetainedStream()
+			return "", event.Err
 		}
 
-		if event.Err != nil {
-			return "", event.Err
+		hasMessageOutput := event.Output != nil && event.Output.MessageOutput != nil
+		if hasMessageOutput {
+			closeRetainedStream()
 		}
 
 		if gen != nil {
@@ -245,10 +261,14 @@ func (at *typedAgentTool[M]) InvokableRun(ctx context.Context, argumentsInJSON s
 			}
 		}
 
+		if hasMessageOutput {
+			finalMessageEvent = event
+		}
 		lastEvent = event
 	}
 
 	if lastEvent != nil && lastEvent.Action != nil && lastEvent.Action.Interrupted != nil {
+		closeRetainedStream()
 		data, existed, err_ := ms.Get(ctx, bridgeCheckpointID)
 		if err_ != nil {
 			return "", fmt.Errorf("failed to get interrupt info: %w", err_)
@@ -266,8 +286,8 @@ func (at *typedAgentTool[M]) InvokableRun(ctx context.Context, argumentsInJSON s
 	}
 
 	var ret string
-	if lastEvent.Output != nil {
-		if output := lastEvent.Output.MessageOutput; output != nil {
+	if finalMessageEvent != nil && finalMessageEvent.Output != nil {
+		if output := finalMessageEvent.Output.MessageOutput; output != nil {
 			msg, err := output.GetMessage()
 			if err != nil {
 				return "", err
