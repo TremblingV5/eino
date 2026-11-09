@@ -1239,3 +1239,83 @@ func TestCrossTypeAgentToolGracefulError(t *testing.T) {
 			"Error should mention cross-message-type incompatibility")
 	}
 }
+
+// trailingControlEventAgent emits a final message event followed by a control-only
+// event, mirroring a ChatModelAgent whose AfterAgent middleware sends a custom event.
+type trailingControlEventAgent struct {
+	streaming bool
+}
+
+func (a *trailingControlEventAgent) Name(context.Context) string        { return "trailing" }
+func (a *trailingControlEventAgent) Description(context.Context) string { return "trailing" }
+
+func (a *trailingControlEventAgent) Run(context.Context, *AgentInput, ...AgentRunOption) *AsyncIterator[*AgentEvent] {
+	it, gen := NewAsyncIteratorPair[*AgentEvent]()
+	go func() {
+		mv := &MessageVariant{IsStreaming: a.streaming, Role: schema.Assistant}
+		if a.streaming {
+			mv.MessageStream = schema.StreamReaderFromArray([]*schema.Message{schema.AssistantMessage("verified answer", nil)})
+		} else {
+			mv.Message = schema.AssistantMessage("verified answer", nil)
+		}
+		gen.Send(&AgentEvent{AgentName: "trailing", Output: &AgentOutput{MessageOutput: mv}})
+		gen.Send(&AgentEvent{AgentName: "trailing", Action: &AgentAction{CustomizedAction: "audit complete"}})
+		gen.Close()
+	}()
+	return it
+}
+
+// agenticTrailingControlEventAgent is the *schema.AgenticMessage counterpart.
+type agenticTrailingControlEventAgent struct {
+	streaming bool
+}
+
+func (a *agenticTrailingControlEventAgent) Name(context.Context) string { return "agentic-trailing" }
+func (a *agenticTrailingControlEventAgent) Description(context.Context) string {
+	return "agentic-trailing"
+}
+
+func (a *agenticTrailingControlEventAgent) Run(context.Context, *TypedAgentInput[*schema.AgenticMessage], ...AgentRunOption) *AsyncIterator[*TypedAgentEvent[*schema.AgenticMessage]] {
+	it, gen := NewAsyncIteratorPair[*TypedAgentEvent[*schema.AgenticMessage]]()
+	go func() {
+		mv := &TypedMessageVariant[*schema.AgenticMessage]{
+			IsStreaming: a.streaming,
+			AgenticRole: schema.AgenticRoleTypeAssistant,
+		}
+		if a.streaming {
+			mv.MessageStream = schema.StreamReaderFromArray([]*schema.AgenticMessage{agenticMsg("verified answer")})
+		} else {
+			mv.Message = agenticMsg("verified answer")
+		}
+		gen.Send(&TypedAgentEvent[*schema.AgenticMessage]{
+			AgentName: "agentic-trailing",
+			Output:    &TypedAgentOutput[*schema.AgenticMessage]{MessageOutput: mv},
+		})
+		gen.Send(&TypedAgentEvent[*schema.AgenticMessage]{
+			AgentName: "agentic-trailing",
+			Action:    &AgentAction{CustomizedAction: "audit complete"},
+		})
+		gen.Close()
+	}()
+	return it
+}
+
+func TestAgentTool_TrailingControlEventKeepsFinalAnswer(t *testing.T) {
+	ctx := context.Background()
+
+	for _, streaming := range []bool{false, true} {
+		t.Run(fmt.Sprintf("message streaming=%v", streaming), func(t *testing.T) {
+			at := NewAgentTool(ctx, &trailingControlEventAgent{streaming: streaming})
+			out, err := at.(tool.InvokableTool).InvokableRun(ctx, `{"request":"q"}`)
+			require.NoError(t, err)
+			assert.Equal(t, "verified answer", out)
+		})
+
+		t.Run(fmt.Sprintf("agentic message streaming=%v", streaming), func(t *testing.T) {
+			at := NewTypedAgentTool(ctx, TypedAgent[*schema.AgenticMessage](&agenticTrailingControlEventAgent{streaming: streaming}))
+			out, err := at.(tool.InvokableTool).InvokableRun(ctx, `{"request":"q"}`)
+			require.NoError(t, err)
+			assert.Equal(t, "verified answer", out)
+		})
+	}
+}
