@@ -54,12 +54,15 @@ func NewMessageJSONParser[T any](config *MessageJSONParseConfig) MessageParser[T
 		config = &MessageJSONParseConfig{}
 	}
 
-	if config.ParseFrom == "" {
-		config.ParseFrom = MessageParseFromContent
+	// Apply the default on a local copy: the caller's config may be shared
+	// between goroutines and must not be mutated by the constructor.
+	parseFrom := config.ParseFrom
+	if parseFrom == "" {
+		parseFrom = MessageParseFromContent
 	}
 
 	return &MessageJSONParser[T]{
-		ParseFrom:    config.ParseFrom,
+		ParseFrom:    parseFrom,
 		ParseKeyPath: config.ParseKeyPath,
 	}
 }

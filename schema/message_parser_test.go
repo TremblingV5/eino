@@ -18,6 +18,7 @@ package schema
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -176,4 +177,29 @@ func TestMessageJSONParser(t *testing.T) {
 		assert.NotNil(t, err)
 	})
 
+	t.Run("constructor does not mutate the given config", func(t *testing.T) {
+		config := &MessageJSONParseConfig{ParseKeyPath: "id"}
+		parser := NewMessageJSONParser[int](config)
+
+		assert.Equal(t, MessageParseFrom(""), config.ParseFrom)
+
+		parsed, err := parser.Parse(ctx, &Message{Content: `{"id": 1}`})
+		assert.NoError(t, err)
+		assert.Equal(t, 1, parsed)
+	})
+
+	t.Run("constructor is safe with a shared config", func(t *testing.T) {
+		config := &MessageJSONParseConfig{ParseKeyPath: "id"}
+		var group sync.WaitGroup
+		for i := 0; i < 32; i++ {
+			group.Add(1)
+			go func() {
+				defer group.Done()
+				NewMessageJSONParser[int](config)
+			}()
+		}
+		group.Wait()
+
+		assert.Equal(t, MessageParseFrom(""), config.ParseFrom)
+	})
 }
