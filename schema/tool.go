@@ -182,18 +182,23 @@ func (t *ToolInfo) UnmarshalJSON(data []byte) error {
 	t.Name = tmp.Name
 	t.Desc = tmp.Desc
 	t.Extra = tmp.Extra
-	if tmp.HasParamsOneOf {
-		t.ParamsOneOf = &ParamsOneOf{
-			params:     tmp.Params,
-			jsonschema: tmp.JSONSchema,
-		}
-		// An empty-but-non-nil params map is dropped by `omitempty` during
-		// marshaling. When jsonschema is also absent, the params form was the
-		// chosen representation, so restore the empty map to preserve the
-		// roundtrip invariant.
-		if t.ParamsOneOf.params == nil && t.ParamsOneOf.jsonschema == nil {
-			t.ParamsOneOf.params = map[string]*ParameterInfo{}
-		}
+	if !tmp.HasParamsOneOf {
+		// The decoded tool declares no parameters, so drop any schema left on
+		// the receiver. Otherwise a reused ToolInfo keeps the previous tool's
+		// parameters, exposing arguments the new tool does not accept.
+		t.ParamsOneOf = nil
+		return nil
+	}
+	t.ParamsOneOf = &ParamsOneOf{
+		params:     tmp.Params,
+		jsonschema: tmp.JSONSchema,
+	}
+	// An empty-but-non-nil params map is dropped by `omitempty` during
+	// marshaling. When jsonschema is also absent, the params form was the
+	// chosen representation, so restore the empty map to preserve the
+	// roundtrip invariant.
+	if t.ParamsOneOf.params == nil && t.ParamsOneOf.jsonschema == nil {
+		t.ParamsOneOf.params = map[string]*ParameterInfo{}
 	}
 	return nil
 }
@@ -232,6 +237,9 @@ func (t *ToolInfo) GobDecode(b []byte) error {
 	t.Desc = tmp.Desc
 	t.Extra = tmp.Extra
 	if !tmp.HasParamsOneOf {
+		// Same as UnmarshalJSON: a parameterless definition must clear the
+		// receiver's previous schema.
+		t.ParamsOneOf = nil
 		return nil
 	}
 	t.ParamsOneOf = &ParamsOneOf{

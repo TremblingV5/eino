@@ -197,6 +197,40 @@ func TestToolInfoSerialization(t *testing.T) {
 	assert.Equal(t, tiEmpty, result)
 }
 
+func TestToolInfoDecodeIntoPopulatedValue(t *testing.T) {
+	populated := func() *ToolInfo {
+		return &ToolInfo{
+			Name: "lookup",
+			ParamsOneOf: NewParamsOneOfByParams(map[string]*ParameterInfo{
+				"query": {Type: String, Required: true},
+			}),
+		}
+	}
+
+	t.Run("json", func(t *testing.T) {
+		data, err := json.Marshal(&ToolInfo{Name: "ping"})
+		assert.NoError(t, err)
+
+		previous := populated()
+		err = json.Unmarshal(data, previous)
+		assert.NoError(t, err)
+		assert.Equal(t, "ping", previous.Name)
+		assert.Nil(t, previous.ParamsOneOf)
+	})
+
+	t.Run("gob", func(t *testing.T) {
+		buf := new(bytes.Buffer)
+		err := gob.NewEncoder(buf).Encode(&ToolInfo{Name: "ping"})
+		assert.NoError(t, err)
+
+		previous := populated()
+		err = gob.NewDecoder(bytes.NewBuffer(buf.Bytes())).Decode(previous)
+		assert.NoError(t, err)
+		assert.Equal(t, "ping", previous.Name)
+		assert.Nil(t, previous.ParamsOneOf)
+	})
+}
+
 func TestMCPToolResult_NilErrorCode(t *testing.T) {
 	result := &MCPToolResult{
 		CallID:  "test-call",
