@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/url"
 	"path/filepath"
 
 	"github.com/cloudwego/eino/schema"
@@ -39,14 +40,27 @@ type ExtParserConfig struct {
 	FallbackParser Parser
 }
 
+// extFromURI returns the extension used to choose a parser. For HTTP(S) sources
+// the extension is taken from the URL path, so query strings and extensions in
+// the hostname do not affect parser selection. Other inputs keep the native
+// filepath.Ext behavior.
+func extFromURI(uri string) string {
+	if u, err := url.Parse(uri); err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" {
+		return filepath.Ext(u.Path)
+	}
+
+	return filepath.Ext(uri)
+}
+
 // ExtParser is a parser that uses the file extension to determine which parser to use.
 // You can register your own parsers by calling RegisterParser.
 // Default parser is TextParser.
 // Note:
 //
-//	parse 时，是通过 filepath.Ext(uri) 的方式找到对应的 parser，因此使用时需要：
+//	parse 时，是通过 URI 的扩展名找到对应的 parser（HTTP(S) URI 使用 URL path 的扩展名，
+//	其余 URI 使用 filepath.Ext），因此使用时需要：
 //	 	① 必须使用 parser.WithURI 在请求时传入 URI
-//	 	② URI 必须能通过 filepath.Ext 来解析出符合预期的 ext
+//	 	② URI 必须能解析出符合预期的 ext
 //
 // eg:
 //
@@ -95,7 +109,7 @@ func (p *ExtParser) GetParsers() map[string]Parser {
 func (p *ExtParser) Parse(ctx context.Context, reader io.Reader, opts ...Option) ([]*schema.Document, error) {
 	opt := GetCommonOptions(&Options{}, opts...)
 
-	ext := filepath.Ext(opt.URI)
+	ext := extFromURI(opt.URI)
 
 	parser, ok := p.parsers[ext]
 

@@ -20,6 +20,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -33,6 +34,16 @@ type ParserForTest struct {
 
 func (p *ParserForTest) Parse(ctx context.Context, reader io.Reader, opts ...Option) ([]*schema.Document, error) {
 	return p.mock()
+}
+
+type uriRecordingParser struct {
+	uri string
+}
+
+func (p *uriRecordingParser) Parse(ctx context.Context, reader io.Reader, opts ...Option) ([]*schema.Document, error) {
+	p.uri = GetCommonOptions(&Options{}, opts...).URI
+
+	return []*schema.Document{{Content: "parsed"}}, nil
 }
 
 func TestParser(t *testing.T) {
@@ -114,5 +125,42 @@ func TestParser(t *testing.T) {
 
 		ps := p.GetParsers()
 		assert.Equal(t, 1, len(ps))
+	})
+
+	t.Run("select parser by extension of the source path", func(t *testing.T) {
+		cases := []struct {
+			uri         string
+			wantMD      bool
+			description string
+		}{
+			{"https://example.com/notes.md?download=true", true, "query string must not hide the path extension"},
+			{"https://example.com?name=notes.md", false, "query string must not select a parser"},
+			{"https://example.md", false, "hostname must not select a parser"},
+			{"testdata/test.md", true, "local path keeps native extension handling"},
+			{"notes.txt", false, "unregistered extension falls back"},
+		}
+
+		for _, c := range cases {
+			mdParser := &uriRecordingParser{}
+			fallbackParser := &uriRecordingParser{}
+			p, err := NewExtParser(ctx, &ExtParserConfig{
+				Parsers: map[string]Parser{
+					".md": mdParser,
+				},
+				FallbackParser: fallbackParser,
+			})
+			assert.NoError(t, err)
+
+			_, err = p.Parse(ctx, strings.NewReader("raw"), WithURI(c.uri))
+			assert.NoError(t, err)
+
+			if c.wantMD {
+				assert.Equal(t, c.uri, mdParser.uri, c.description)
+				assert.Empty(t, fallbackParser.uri, c.description)
+			} else {
+				assert.Equal(t, c.uri, fallbackParser.uri, c.description)
+				assert.Empty(t, mdParser.uri, c.description)
+			}
+		}
 	})
 }
