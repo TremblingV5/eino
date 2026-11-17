@@ -947,6 +947,18 @@ func TestConcatMessage(t *testing.T) {
 
 		assert.Equal(t, expectedMultiContent, mergedMsg.MultiContent)
 	})
+
+	t.Run("different_tool_names_error_reports_names", func(t *testing.T) {
+		msgs := []*Message{
+			{Role: Tool, ToolCallID: "call_1", ToolName: "lookup"},
+			{Role: Tool, ToolCallID: "call_1", ToolName: "summarize"},
+		}
+
+		_, err := ConcatMessages(msgs)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "'lookup'")
+		assert.Contains(t, err.Error(), "'summarize'")
+	})
 }
 
 func TestConcatToolCalls(t *testing.T) {
