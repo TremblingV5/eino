@@ -45,6 +45,7 @@ func runConformanceTests[M adk.MessageType](t *testing.T, factory func(testing.T
 	t.Run("Empty session returns no events", func(t *testing.T) { testEmptySession(t, factory) })
 	t.Run("AppendEvents rejects non-replay duplicate EventID", func(t *testing.T) { testRejectDuplicateEventID(t, factory, makeMessage) })
 	t.Run("AppendEvents rejects duplicate EventID within same batch", func(t *testing.T) { testRejectDuplicateEventIDWithinBatch(t, factory, makeMessage) })
+	t.Run("AppendEvents rejects stored duplicate in batch without partial write", func(t *testing.T) { testRejectStoredDuplicateWithinBatch(t, factory, makeMessage) })
 	t.Run("AppendEvents rejects empty EventID with ErrInvalidEventID", func(t *testing.T) { testRejectEmptyEventID(t, factory, makeMessage) })
 	t.Run("After resumes by EventID forward", func(t *testing.T) { testAfterForward(t, factory, makeMessage) })
 	t.Run("After resumes by EventID reverse", func(t *testing.T) { testAfterReverse(t, factory, makeMessage) })
@@ -252,6 +253,25 @@ func testRejectDuplicateEventIDWithinBatch[M adk.MessageType](t *testing.T, fact
 	res, err := store.LoadEvents(ctx, "s", &adk.LoadSessionEventsRequest{})
 	requireNoError(t, err)
 	requireEventsEqual(t, nil, res.Events)
+}
+
+func testRejectStoredDuplicateWithinBatch[M adk.MessageType](t *testing.T, factory func(testing.TB) adk.SessionEventStore[M], makeMessage func(string) M) {
+	store := newStore(t, factory)
+	ctx := context.Background()
+
+	stored := messageEvent("stored-1", makeMessage("stored"))
+	appendEvents(t, ctx, store, "s", stored)
+
+	fresh := messageEvent("fresh-1", makeMessage("fresh"))
+	dup := messageEvent("stored-1", makeMessage("duplicate of stored"))
+	err := store.AppendEvents(ctx, "s", []*adk.SessionEvent[M]{fresh, dup})
+	if !errors.Is(err, adk.ErrDuplicateEventID) {
+		t.Fatalf("expected ErrDuplicateEventID, got %v", err)
+	}
+
+	res, err := store.LoadEvents(ctx, "s", &adk.LoadSessionEventsRequest{})
+	requireNoError(t, err)
+	requireEventsEqual(t, []*adk.SessionEvent[M]{stored}, res.Events)
 }
 
 func testRejectEmptyEventID[M adk.MessageType](t *testing.T, factory func(testing.TB) adk.SessionEventStore[M], makeMessage func(string) M) {
