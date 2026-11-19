@@ -311,6 +311,58 @@ func TestFileStoreRejectsCorruptedRecordsOnIndexRebuild(t *testing.T) {
 	}
 }
 
+func TestFileStoreRejectsLineDelimitersInEventIDAndKind(t *testing.T) {
+	ctx := context.Background()
+
+	cases := []struct {
+		name    string
+		eventID string
+		kind    string
+		wantErr error
+	}{
+		{name: "event id LF", eventID: "bad\nid", wantErr: adk.ErrInvalidEventID},
+		{name: "event id CR", eventID: "bad\rid", wantErr: adk.ErrInvalidEventID},
+		{name: "event id tab", eventID: "bad\tid", wantErr: adk.ErrInvalidEventID},
+		{name: "kind tab", eventID: "kind-tab", kind: "x.bad\tkind"},
+		{name: "kind LF", eventID: "kind-lf", kind: "x.bad\nkind"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			store, err := NewFileStore[*schema.Message](dir, nil)
+			require.NoError(t, err)
+			require.NoError(t, store.AppendEvents(ctx, "s", []*adk.SessionEvent[*schema.Message]{
+				testMessageEvent("ok-1", "ok"),
+			}))
+
+			var bad *adk.SessionEvent[*schema.Message]
+			if tc.kind != "" {
+				bad = extensionEvent[*schema.Message](tc.eventID, tc.kind)
+			} else {
+				bad = testMessageEvent(tc.eventID, "bad")
+			}
+
+			// The valid event in the same batch must not be written either.
+			err = store.AppendEvents(ctx, "s", []*adk.SessionEvent[*schema.Message]{
+				testMessageEvent("new-1", "new"),
+				bad,
+			})
+			require.Error(t, err)
+			if tc.wantErr != nil {
+				require.ErrorIs(t, err, tc.wantErr)
+			}
+
+			reopened, err := NewFileStore[*schema.Message](dir, nil)
+			require.NoError(t, err)
+			res, err := reopened.LoadEvents(ctx, "s", &adk.LoadSessionEventsRequest{})
+			require.NoError(t, err)
+			require.Len(t, res.Events, 1)
+			assert.Equal(t, "ok-1", res.Events[0].EventID)
+		})
+	}
+}
+
 type newlineSerializer struct{}
 
 func (newlineSerializer) Marshal(any) ([]byte, error) {

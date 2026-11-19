@@ -136,8 +136,14 @@ func (s *FileStore[M]) AppendEvents(_ context.Context, sessionID string, events 
 			return adk.ErrDuplicateEventID
 		}
 		seen[e.EventID] = struct{}{}
+		if strings.ContainsAny(e.EventID, "\t\r\n") {
+			return fmt.Errorf("%w: event_id %q contains a tab, CR or LF", adk.ErrInvalidEventID, e.EventID)
+		}
 		if normalizeErr := adk.NormalizeSessionEventKind(e); normalizeErr != nil {
 			return normalizeErr
+		}
+		if strings.ContainsAny(string(e.Kind), "\t\r\n") {
+			return fmt.Errorf("adk/session: session event kind %q contains a tab, CR or LF", e.Kind)
 		}
 		data, marshalErr := s.serializer.Marshal(e)
 		if marshalErr != nil {
